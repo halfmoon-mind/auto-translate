@@ -2,10 +2,9 @@
   "name": "codex-context-translator-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Local bridge for a personal Codex-powered Chrome translator.",
+  "description": "Native bridge runtime for a Codex-powered Chrome translator.",
   "scripts": {
-    "start": "node index.js",
-    "check": "node --check index.js && node --check translator.js"
+    "check": "node --check translator.js"
   },
   "engines": {
     "node": ">=18"

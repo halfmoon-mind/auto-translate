@@ -1,8 +1,10 @@
 const path = require("node:path");
+const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const PRICING_SNAPSHOT = require("./openai-pricing-snapshot.json");
 
 const CODEX_BIN = process.env.CODEX_TRANSLATOR_CODEX_BIN || "codex";
+const REQUIRED_NODE_MAJOR = 18;
 const DEFAULT_MODEL = "gpt-5.4-mini";
 const DEFAULT_EFFORT = "low";
 const MODEL = process.env.CODEX_TRANSLATOR_MODEL ?? DEFAULT_MODEL;
@@ -40,14 +42,79 @@ const TARGET_KINDS = new Set([
 ]);
 
 function getBridgeInfo() {
-  return {
-    ok: true,
+  const nodeStatus = getNodeStatus();
+  const codexPath = resolveExecutable(CODEX_BIN);
+  const baseInfo = {
     model: MODEL || "default",
     effort: EFFORT,
-    codex: CODEX_BIN,
+    codex: codexPath || CODEX_BIN,
+    node: process.version,
     maxParagraphsPerRun: MAX_PARAGRAPHS_PER_RUN,
     maxParallelRuns: MAX_PARALLEL_RUNS,
   };
+
+  if (!nodeStatus.ok) {
+    return {
+      ...baseInfo,
+      ok: false,
+      setupCode: "node_unsupported",
+      error: `Node.js ${REQUIRED_NODE_MAJOR} 이상이 필요합니다. 현재 버전은 ${process.version}입니다.`,
+    };
+  }
+
+  if (!codexPath) {
+    return {
+      ...baseInfo,
+      ok: false,
+      setupCode: "codex_missing",
+      error: "Codex CLI를 찾지 못했습니다. Codex CLI를 설치하고 codex login을 실행하세요.",
+    };
+  }
+
+  return {
+    ...baseInfo,
+    ok: true,
+  };
+}
+
+function getNodeStatus() {
+  const major = Number.parseInt(process.versions.node.split(".")[0], 10);
+  return {
+    ok: Number.isFinite(major) && major >= REQUIRED_NODE_MAJOR,
+    major,
+  };
+}
+
+function resolveExecutable(command) {
+  if (!command) {
+    return null;
+  }
+
+  if (command.includes(path.sep) || (path.sep === "\\" && command.includes("/"))) {
+    return isExecutable(command) ? command : null;
+  }
+
+  for (const pathEntry of (process.env.PATH || "").split(path.delimiter)) {
+    if (!pathEntry) {
+      continue;
+    }
+
+    const candidate = path.join(pathEntry, command);
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function isExecutable(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function translatePayload(payload) {

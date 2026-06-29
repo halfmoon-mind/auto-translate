@@ -3,6 +3,9 @@ const restoreButton = document.getElementById("restoreButton");
 const statusText = document.getElementById("statusText");
 const serverStatus = document.getElementById("serverStatus");
 const elapsedText = document.getElementById("elapsedText");
+const setupActions = document.getElementById("setupActions");
+const setupButton = document.getElementById("setupButton");
+const retryBridgeButton = document.getElementById("retryBridgeButton");
 
 const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs.v2";
 const FALLBACK_WAVE_MS_MIN = 20000;
@@ -31,6 +34,9 @@ function init() {
   restoreButton.addEventListener("click", () => {
     runOnActiveTab("CODEX_RESTORE_PAGE");
   });
+
+  setupButton.addEventListener("click", openSetupPage);
+  retryBridgeButton.addEventListener("click", checkServerHealth);
 
   chrome.runtime.onMessage.addListener((message, sender) => {
     if (message?.type === "CODEX_TRANSLATION_STATUS") {
@@ -71,16 +77,22 @@ async function checkServerHealth() {
     const response = await sendRuntimeMessage({ type: "CODEX_LOCAL_HEALTH" });
 
     if (!response?.ok) {
-      throw new Error(response?.error || "로컬 브리지 연결 실패");
+      throw new Error(response?.error || "로컬 브리지 설정이 필요합니다.");
     }
 
     serverStatus.textContent = `로컬 브리지 / ${response.model} / ${response.effort}`;
+    setupActions.hidden = true;
   } catch (error) {
-    serverStatus.textContent = "로컬 브리지 연결 실패";
+    serverStatus.textContent = "로컬 브리지 설정 필요";
+    setupActions.hidden = false;
     if (!hasRenderedStatus) {
       statusText.textContent = getErrorMessage(error);
     }
   }
+}
+
+function openSetupPage() {
+  chrome.tabs.create({ url: chrome.runtime.getURL("setup.html") });
 }
 
 async function runOnActiveTab(type, options = {}) {
@@ -431,6 +443,8 @@ function formatDuration(milliseconds) {
 function setBusy(isBusy) {
   translateButton.disabled = isBusy;
   restoreButton.disabled = isBusy;
+  setupButton.disabled = isBusy;
+  retryBridgeButton.disabled = isBusy;
 }
 
 function queryTabs(query) {

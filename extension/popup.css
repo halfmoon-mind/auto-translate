@@ -51,6 +51,17 @@ h1 {
   margin-bottom: 12px;
 }
 
+.setup-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.setup-actions[hidden] {
+  display: none;
+}
+
 button {
   min-height: 36px;
   border: 1px solid #1769d8;
