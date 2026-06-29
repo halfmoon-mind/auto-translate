@@ -102,6 +102,10 @@
   const STYLE_ID = "codex-context-translator-style";
   const INLINE_LINK_SELECTOR = "a[href]";
   const INLINE_PRESERVE_SELECTOR = [
+    "pre",
+    "code",
+    "kbd",
+    "samp",
     "br",
     "wbr",
     "img",

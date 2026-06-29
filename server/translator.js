@@ -29,6 +29,16 @@ const MAX_PARALLEL_RUNS = Math.min(
   4,
   Math.max(1, Number.parseInt(process.env.CODEX_TRANSLATOR_MAX_PARALLEL_RUNS || "4", 10) || 4),
 );
+const CODEX_RETRY_DELAYS_MS = parseRetryDelays(
+  process.env.CODEX_TRANSLATOR_RETRY_DELAYS_MS || "2000,5000,10000",
+);
+const MAX_CODEX_ATTEMPTS = Math.max(
+  1,
+  Number.parseInt(
+    process.env.CODEX_TRANSLATOR_RETRY_ATTEMPTS || String(CODEX_RETRY_DELAYS_MS.length + 1),
+    10,
+  ) || 1,
+);
 const MAX_STDIO_BYTES = 2 * 1024 * 1024;
 const SCHEMA_PATH = path.join(__dirname, "translation-schema.json");
 const TARGET_KINDS = new Set([
@@ -257,7 +267,7 @@ async function translateRequest(request) {
       },
       paragraphs,
     });
-    const codexResult = await runCodex(prompt);
+    const codexResult = await runCodexWithRetry(prompt);
     const translations = normalizeTranslations(codexResult, paragraphs);
 
     return {
@@ -325,6 +335,29 @@ function createTranslationBatches(paragraphs) {
   }
 
   return batches;
+}
+
+async function runCodexWithRetry(prompt) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= MAX_CODEX_ATTEMPTS; attempt += 1) {
+    try {
+      return await runCodex(prompt);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= MAX_CODEX_ATTEMPTS || !isRetryableCodexError(error)) {
+        throw error;
+      }
+
+      const delayMs = CODEX_RETRY_DELAYS_MS[
+        Math.min(attempt - 1, CODEX_RETRY_DELAYS_MS.length - 1)
+      ] || 0;
+      await wait(delayMs);
+    }
+  }
+
+  throw lastError;
 }
 
 function runCodex(prompt) {
@@ -446,6 +479,60 @@ function prependPathEntries(currentPath, entries) {
   }
 
   return pathEntries.join(":");
+}
+
+function parseRetryDelays(value) {
+  const delays = String(value || "")
+    .split(",")
+    .map((entry) => Number.parseInt(entry.trim(), 10))
+    .filter((entry) => Number.isFinite(entry) && entry >= 0);
+
+  return delays.length > 0 ? delays : [2000, 5000, 10000];
+}
+
+function isRetryableCodexError(error) {
+  const message = getErrorMessage(error).toLowerCase();
+
+  if (
+    message.includes("not logged in") ||
+    message.includes("log in") ||
+    message.includes("unauthorized") ||
+    message.includes("authentication") ||
+    message.includes("forbidden") ||
+    message.includes("invalid api key")
+  ) {
+    return false;
+  }
+
+  return [
+    "timed out",
+    "timeout",
+    "network",
+    "connection",
+    "connect",
+    "disconnected",
+    "offline",
+    "dns",
+    "econnreset",
+    "econnrefused",
+    "etimedout",
+    "enotfound",
+    "eai_again",
+    "socket hang up",
+    "temporarily unavailable",
+    "too many requests",
+    "rate limit",
+  ].some((term) => message.includes(term));
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function normalizeEffort(value) {
