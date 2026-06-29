@@ -17,7 +17,7 @@ For a truly polished release, ship a signed companion installer per OS. The inst
 ## Requirements
 
 - macOS and Google Chrome for the packaged installer included here.
-- Windows is technically supported by Chrome Native Messaging, but this repo still needs a Windows host executable wrapper and installer package before it is a turnkey Windows release.
+- Windows is not provided as an installable release yet. Chrome Native Messaging supports Windows, but this repo still needs a Windows host executable wrapper and installer package before Windows users can complete setup.
 - Node.js 18 or newer.
 - Codex CLI installed and logged in with ChatGPT: `codex login`.
 
@@ -64,9 +64,11 @@ Because the runtime is copied during install, users can move or delete the downl
 
 The installer reports each step before it runs it. If a step fails, the dialog includes the failed step name, exit code, and a short recovery hint. The extension setup page then verifies the installed bridge from Chrome's point of view.
 
-## Windows Status
+## Windows Install Status
 
-Windows can use the same Chrome Native Messaging architecture, but the installation mechanics are different:
+Windows installation is not provided yet. There is currently no `.exe`, `.msi`, registry installer, or Windows host wrapper in this repo, so Windows users cannot complete the local bridge setup from the packaged release.
+
+The Chrome extension can still be installed on Windows, but translation will not work until a Windows companion installer exists. A Windows release needs to implement the same Native Messaging architecture with Windows-specific installation mechanics:
 
 - The native host manifest must be registered under `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.codex_context_translator.host`.
 - The registry default value points to the host manifest JSON.
@@ -80,6 +82,8 @@ A Windows release should install runtime files under a per-user location such as
 ```
 
 Then it should write the registry key, verify Node.js and Codex CLI availability, and open the extension setup page or Chrome Web Store listing.
+
+Until that Windows companion installer is added, Windows should be documented as unsupported for end-user installation.
 
 ## Distribution Notes
 

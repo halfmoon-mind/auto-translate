@@ -9,11 +9,12 @@ const SETUP_COPY = {
   native_host_missing: {
     label: "설치 필요",
     title: "로컬 브리지가 아직 설치되지 않았습니다.",
-    message: "macOS companion installer를 실행한 뒤 이 화면에서 다시 확인하세요.",
+    message: "macOS라면 companion installer를 실행한 뒤 이 화면에서 다시 확인하세요. Windows installer는 아직 제공되지 않습니다.",
     steps: [
-      "배포 폴더에서 companion/macos를 엽니다.",
+      "macOS라면 배포 폴더에서 companion/macos를 엽니다.",
       "Codex Translator Installer.app을 실행합니다.",
       "완료 dialog를 확인한 뒤 다시 확인을 누릅니다.",
+      "Windows는 아직 companion installer가 제공되지 않아 로컬 브리지 설정을 완료할 수 없습니다.",
     ],
   },
   native_host_unreachable: {
