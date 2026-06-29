@@ -20,22 +20,8 @@
     "td",
     "dt",
     "dd",
-    "article div",
-    "main div",
-    "[role='main'] div",
-    "section div",
-    "article span[dir]",
-    "main span[dir]",
-    "[role='main'] span[dir]",
-    "section span[dir]",
-  ].join(",");
-  const STRUCTURAL_UI_SELECTOR = [
-    "body > header",
-    "body > footer",
-    "#header",
-    "#footer",
-    "[role='banner']",
-    "[role='contentinfo']",
+    "body div",
+    "span[dir]",
   ].join(",");
   const MAIN_CONTENT_SELECTOR = [
     "main",
@@ -62,7 +48,6 @@
     "[role='checkbox']",
     "[role='switch']",
     "[onclick]",
-    "[tabindex]:not([tabindex='-1'])",
   ].join(",");
   const BLOCKING_DESCENDANT_SELECTOR = [
     "button",
@@ -77,7 +62,6 @@
     "[role='checkbox']",
     "[role='switch']",
     "[onclick]",
-    "[tabindex]:not([tabindex='-1'])",
   ].join(",");
   const EXCLUDED_ANCESTOR_SELECTOR = [
     "script",
@@ -92,7 +76,6 @@
     "select",
     "svg",
     "canvas",
-    STRUCTURAL_UI_SELECTOR,
     INTERACTIVE_SELECTOR,
     "[hidden]",
     "[aria-hidden='true']",
@@ -119,6 +102,29 @@
   const STYLE_ID = "codex-context-translator-style";
   const INLINE_LINK_SELECTOR = "a[href]";
   const INLINE_PRESERVE_SELECTOR = [
+    "br",
+    "wbr",
+    "img",
+    "picture",
+    "svg",
+    "canvas",
+    "audio",
+    "video",
+    "sup",
+    "sub",
+    "[role='doc-noteref']",
+    "[role='doc-biblioref']",
+    "a[rel~='footnote']",
+    "a[role='doc-noteref']",
+    "a[role='doc-biblioref']",
+    "a.footnote",
+    "a.footnote-ref",
+    "a.noteref",
+    "a[href^='#fn']",
+    "a[href^='#footnote']",
+    "a[href^='#endnote']",
+    "a[href^='#note']",
+    "a[href^='#ref']",
     "span.math",
     ".math",
     "mjx-container",
@@ -127,11 +133,29 @@
     ".katex",
     "math",
   ].join(",");
+  const INLINE_FORMAT_SELECTOR = [
+    "strong",
+    "b",
+    "em",
+    "i",
+    "mark",
+    "small",
+    "s",
+    "del",
+    "ins",
+    "u",
+    "cite",
+    "abbr",
+    "dfn",
+    "q",
+  ].join(",");
   const LINK_TOKEN_PREFIX = "CTX-LINK-";
   const PRESERVE_TOKEN_PREFIX = "CTX-PRESERVE-";
-  const INLINE_MARKER_PATTERN = /\[\[(CTX-LINK-\d+)\]\]([\s\S]*?)\[\[\/\1\]\]|\[\[(CTX-PRESERVE-\d+)\]\]/g;
+  const FORMAT_TOKEN_PREFIX = "CTX-FMT-";
+  const INLINE_MARKER_PATTERN = /\[\[(\/?CTX-(?:LINK|FMT|PRESERVE)-\d+)\]\]/g;
   const ANY_LINK_MARKER_PATTERN = /\[\[\/?CTX-LINK-\d+\]\]/g;
-  const ANY_PRESERVE_MARKER_PATTERN = /\[\[CTX-PRESERVE-\d+\]\]/g;
+  const ANY_PRESERVE_MARKER_PATTERN = /\[\[\/?CTX-PRESERVE-\d+\]\]/g;
+  const ANY_FORMAT_MARKER_PATTERN = /\[\[\/?CTX-FMT-\d+\]\]/g;
   const MAX_CONTEXT_ITEMS = 12;
   const MAX_CONTEXT_SNIPPET_CHARS = 120;
   const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 10;
@@ -139,6 +163,7 @@
   const ESTIMATE_MAX_PARALLEL_RUNS = 8;
   const PRIORITY_BATCH_MAX_PARAGRAPHS = 4;
   const PRIORITY_BATCH_MAX_TARGET_CHARS = 1200;
+  const COLLECT_RETRY_DELAYS_MS = [250, 750];
   const MAX_RETRY_SPLIT_DEPTH = 6;
   const MAX_TRANSLATION_CACHE_ENTRIES = 500;
   const QUALITY_ERROR_PREFIX = "번역 품질 검증 실패";
@@ -191,7 +216,7 @@
 
     try {
       publishStatus("collecting", "번역할 단락을 찾는 중입니다.", null, null, { startedAt });
-      const items = collectItems();
+      const items = await collectItemsWhenReady();
 
       if (items.length === 0) {
         throw new Error("번역할 단락을 찾지 못했습니다.");
@@ -249,7 +274,25 @@
   }
 
   function collectItems() {
-    const nodes = collectCandidateNodes();
+    return collectItemsFromNodes(collectCandidateNodes());
+  }
+
+  async function collectItemsWhenReady() {
+    let items = collectItems();
+
+    for (const delayMs of COLLECT_RETRY_DELAYS_MS) {
+      if (items.length > 0) {
+        return items;
+      }
+
+      await wait(delayMs);
+      items = collectItems();
+    }
+
+    return items;
+  }
+
+  function collectItemsFromNodes(nodes) {
     const items = [];
     const seen = new Set();
 
@@ -282,10 +325,17 @@
         text: serialized.text,
         links: serialized.links,
         preservedNodes: serialized.preservedNodes,
+        formatNodes: serialized.formatNodes,
       });
     }
 
     return items;
+  }
+
+  function wait(delayMs) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
   }
 
   function hasSelectedAncestor(element, selectedElements) {
@@ -311,17 +361,6 @@
   }
 
   function getCandidateText(element) {
-    const tagName = element.tagName.toLowerCase();
-
-    if (tagName === "div") {
-      return normalizeText(
-        Array.from(element.childNodes)
-          .filter((node) => node.nodeType === Node.TEXT_NODE)
-          .map((node) => node.textContent || "")
-          .join(" "),
-      );
-    }
-
     return normalizeText(element.innerText || element.textContent || "");
   }
 
@@ -365,7 +404,11 @@
 
     const tagName = element.tagName.toLowerCase();
     if (tagName === "div") {
-      if (text.length < 40 || element.querySelector(BLOCK_DESCENDANT_SELECTOR)) {
+      if (
+        text.length < 40 ||
+        element.querySelector(BLOCK_DESCENDANT_SELECTOR) ||
+        element.querySelector("div")
+      ) {
         return false;
       }
     }
@@ -380,25 +423,32 @@
   function serializeCandidateText(element, fallbackText) {
     const links = [];
     const preservedNodes = [];
+    const formatNodes = [];
+    const inlineSelector = [
+      INLINE_LINK_SELECTOR,
+      INLINE_PRESERVE_SELECTOR,
+      INLINE_FORMAT_SELECTOR,
+    ].join(",");
 
-    if (!element.querySelector(`${INLINE_LINK_SELECTOR},${INLINE_PRESERVE_SELECTOR}`)) {
-      return { text: fallbackText, links, preservedNodes };
+    if (!element.querySelector(inlineSelector)) {
+      return { text: fallbackText, links, preservedNodes, formatNodes };
     }
 
     const text = normalizeText(
       Array.from(element.childNodes)
-        .map((node) => serializeNodeText(node, links, preservedNodes))
-        .join(" "),
+        .map((node) => serializeNodeText(node, links, preservedNodes, formatNodes))
+        .join(""),
     );
 
     return {
       text: text || fallbackText,
       links,
       preservedNodes,
+      formatNodes,
     };
   }
 
-  function serializeNodeText(node, links, preservedNodes) {
+  function serializeNodeText(node, links, preservedNodes, formatNodes, withinInline = false) {
     if (node.nodeType === Node.TEXT_NODE) {
       return node.textContent || "";
     }
@@ -409,26 +459,87 @@
 
     const element = node;
 
-    if (element.matches(INLINE_LINK_SELECTOR)) {
-      const token = `${LINK_TOKEN_PREFIX}${links.length + 1}`;
-      const text = normalizeText(element.innerText || element.textContent || "");
-      links.push({ token, element });
-      return `[[${token}]]${text}[[/${token}]]`;
-    }
-
-    if (element.matches(INLINE_PRESERVE_SELECTOR)) {
+    if (isInlinePreserveElement(element)) {
       const token = `${PRESERVE_TOKEN_PREFIX}${preservedNodes.length + 1}`;
       preservedNodes.push({ token, element });
       return `[[${token}]]`;
     }
 
-    if (element.closest(EXCLUDED_ANCESTOR_SELECTOR)) {
+    if (element.matches(INLINE_LINK_SELECTOR)) {
+      const token = `${LINK_TOKEN_PREFIX}${links.length + 1}`;
+      links.push({ token, element });
+      const text = serializeElementChildren(element, links, preservedNodes, formatNodes, true);
+      return `[[${token}]]${text}[[/${token}]]`;
+    }
+
+    if (element.matches(INLINE_FORMAT_SELECTOR)) {
+      const token = `${FORMAT_TOKEN_PREFIX}${formatNodes.length + 1}`;
+      formatNodes.push({ token, element });
+      const text = serializeElementChildren(element, links, preservedNodes, formatNodes, true);
+      return `[[${token}]]${text}[[/${token}]]`;
+    }
+
+    if (!withinInline && element.closest(EXCLUDED_ANCESTOR_SELECTOR)) {
       return "";
     }
 
+    return serializeElementChildren(element, links, preservedNodes, formatNodes, withinInline);
+  }
+
+  function serializeElementChildren(element, links, preservedNodes, formatNodes, withinInline) {
     return Array.from(element.childNodes)
-      .map((child) => serializeNodeText(child, links, preservedNodes))
-      .join(" ");
+      .map((child) => serializeNodeText(child, links, preservedNodes, formatNodes, withinInline))
+      .join("");
+  }
+
+  function isInlinePreserveElement(element) {
+    if (!element.matches(INLINE_PRESERVE_SELECTOR)) {
+      return false;
+    }
+
+    if (element.matches(INLINE_LINK_SELECTOR)) {
+      return isFootnoteReferenceElement(element);
+    }
+
+    return true;
+  }
+
+  function isFootnoteReferenceElement(element) {
+    const text = normalizeText(element.innerText || element.textContent || "");
+    const href = String(element.getAttribute("href") || "").toLowerCase();
+    const rel = String(element.getAttribute("rel") || "").toLowerCase();
+    const role = String(element.getAttribute("role") || "").toLowerCase();
+
+    if (
+      element.closest("sup,sub") ||
+      role === "doc-noteref" ||
+      role === "doc-biblioref" ||
+      rel.split(/\s+/).includes("footnote")
+    ) {
+      return true;
+    }
+
+    if (!/#(?:fn|footnote|endnote|note|ref|cite)/.test(href)) {
+      return false;
+    }
+
+    return isShortReferenceText(text);
+  }
+
+  function isShortReferenceText(text) {
+    const compact = text.replace(/[\s()[\].,#:-]/g, "");
+
+    if (!compact || compact.length > 8) {
+      return false;
+    }
+
+    return (
+      /^\d+[a-z]?$/i.test(compact) ||
+      /^[ivxlcdm]+$/i.test(compact) ||
+      /^[a-z]$/i.test(compact) ||
+      /^\*+$/.test(compact) ||
+      /^[\u2020\u2021\u00a7]+$/.test(compact)
+    );
   }
 
   function hasBlockingDescendant(element) {
@@ -461,7 +572,7 @@
   }
 
   function isPreserveOnlyText(text) {
-    return isMostlyNonText(stripPreserveMarkers(stripLinkMarkers(text)));
+    return isMostlyNonText(stripInlineMarkers(text));
   }
 
   function isMostlyKorean(text) {
@@ -1014,22 +1125,34 @@
       throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 결과가 비어 있습니다.`);
     }
 
-    const missingLinkTokens = getMissingLinkTokens(item, text);
-    if (missingLinkTokens.length > 0) {
+    const invalidLinkTokens = getInvalidPairedTokens(item.links || [], text);
+    if (invalidLinkTokens.length > 0) {
       throw new Error(
-        `${QUALITY_ERROR_PREFIX}: ${item.id} 링크 마커가 누락되었습니다 (${missingLinkTokens.join(", ")}).`,
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 링크 마커가 누락되었거나 중복되었습니다 (${invalidLinkTokens.join(", ")}).`,
       );
     }
 
-    const missingPreserveTokens = getMissingPreserveTokens(item, text);
-    if (missingPreserveTokens.length > 0) {
+    const invalidFormatTokens = getInvalidPairedTokens(item.formatNodes || [], text);
+    if (invalidFormatTokens.length > 0) {
       throw new Error(
-        `${QUALITY_ERROR_PREFIX}: ${item.id} 보존 마커가 누락되었습니다 (${missingPreserveTokens.join(", ")}).`,
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 서식 마커가 누락되었거나 중복되었습니다 (${invalidFormatTokens.join(", ")}).`,
       );
     }
 
-    const sourceText = stripPreserveMarkers(stripLinkMarkers(item.text));
-    const targetText = stripPreserveMarkers(stripLinkMarkers(text));
+    const invalidPreserveTokens = getInvalidPreserveTokens(item, text);
+    if (invalidPreserveTokens.length > 0) {
+      throw new Error(
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 보존 마커가 누락되었거나 중복되었습니다 (${invalidPreserveTokens.join(", ")}).`,
+      );
+    }
+
+    const markerNestingError = getInlineMarkerNestingError(item, text);
+    if (markerNestingError) {
+      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 인라인 마커 순서가 깨졌습니다 (${markerNestingError}).`);
+    }
+
+    const sourceText = stripInlineMarkers(item.text);
+    const targetText = stripInlineMarkers(text);
     const missingUrls = getMissingPreservedTokens(extractUrls(sourceText), targetText);
 
     if (missingUrls.length > 0) {
@@ -1045,31 +1168,85 @@
     }
   }
 
-  function getMissingLinkTokens(item, translatedText) {
-    const missing = [];
+  function getInvalidPairedTokens(entries, translatedText) {
+    const invalid = [];
 
-    for (const link of item.links || []) {
+    for (const entry of entries) {
+      const openMarker = `[[${entry.token}]]`;
+      const closeMarker = `[[/${entry.token}]]`;
+
       if (
-        !translatedText.includes(`[[${link.token}]]`) ||
-        !translatedText.includes(`[[/${link.token}]]`)
+        countOccurrences(translatedText, openMarker) !== 1 ||
+        countOccurrences(translatedText, closeMarker) !== 1
       ) {
-        missing.push(link.token);
+        invalid.push(entry.token);
       }
     }
 
-    return missing;
+    return invalid;
   }
 
-  function getMissingPreserveTokens(item, translatedText) {
-    const missing = [];
+  function getInvalidPreserveTokens(item, translatedText) {
+    const invalid = [];
 
     for (const preservedNode of item.preservedNodes || []) {
-      if (!translatedText.includes(`[[${preservedNode.token}]]`)) {
-        missing.push(preservedNode.token);
+      if (countOccurrences(translatedText, `[[${preservedNode.token}]]`) !== 1) {
+        invalid.push(preservedNode.token);
       }
     }
 
-    return missing;
+    return invalid;
+  }
+
+  function getInlineMarkerNestingError(item, translatedText) {
+    const pairedTokens = new Set([
+      ...(item.links || []).map((link) => link.token),
+      ...(item.formatNodes || []).map((formatNode) => formatNode.token),
+    ]);
+    const preserveTokens = new Set((item.preservedNodes || []).map((preservedNode) => preservedNode.token));
+    const stack = [];
+    let match;
+
+    INLINE_MARKER_PATTERN.lastIndex = 0;
+    while ((match = INLINE_MARKER_PATTERN.exec(translatedText))) {
+      const marker = match[1];
+
+      if (marker.startsWith(PRESERVE_TOKEN_PREFIX)) {
+        if (!preserveTokens.has(marker)) {
+          return marker;
+        }
+        continue;
+      }
+
+      if (marker.startsWith("/")) {
+        const token = marker.slice(1);
+        const expected = stack.pop();
+        if (expected !== token) {
+          return token;
+        }
+        continue;
+      }
+
+      if (!pairedTokens.has(marker)) {
+        return marker;
+      }
+
+      stack.push(marker);
+    }
+
+    return stack.length > 0 ? stack[stack.length - 1] : "";
+  }
+
+  function countOccurrences(text, value) {
+    let count = 0;
+    let index = 0;
+
+    while ((index = String(text || "").indexOf(value, index)) !== -1) {
+      count += 1;
+      index += value.length;
+    }
+
+    return count;
   }
 
   function extractUrls(text) {
@@ -1177,6 +1354,7 @@
       translatedText,
       item.links || [],
       item.preservedNodes || [],
+      item.formatNodes || [],
     );
 
     if (fragment) {
@@ -1184,64 +1362,137 @@
       return;
     }
 
-    item.element.textContent = stripPreserveMarkers(stripLinkMarkers(translatedText));
+    item.element.textContent = stripInlineMarkers(translatedText);
   }
 
-  function buildTranslationFragment(translatedText, links, preservedNodes) {
-    if (!links.length && !preservedNodes.length) {
+  function buildTranslationFragment(translatedText, links, preservedNodes, formatNodes) {
+    if (!links.length && !preservedNodes.length && !formatNodes.length) {
       return null;
     }
 
-    const linkByToken = new Map(links.map((link) => [link.token, link.element]));
-    const preservedByToken = new Map(
-      preservedNodes.map((preservedNode) => [preservedNode.token, preservedNode.element]),
-    );
+    const markerMaps = {
+      linkByToken: new Map(links.map((link) => [link.token, link.element])),
+      preservedByToken: new Map(
+        preservedNodes.map((preservedNode) => [preservedNode.token, preservedNode.element]),
+      ),
+      formatByToken: new Map(formatNodes.map((formatNode) => [formatNode.token, formatNode.element])),
+    };
     const fragment = document.createDocumentFragment();
-    let lastIndex = 0;
-    let matchedTokens = 0;
-    let match;
-
-    INLINE_MARKER_PATTERN.lastIndex = 0;
-    while ((match = INLINE_MARKER_PATTERN.exec(translatedText))) {
-      const [fullMatch, linkToken, label, preserveToken] = match;
-
-      if (linkToken) {
-        const link = linkByToken.get(linkToken);
-        if (!link) {
-          continue;
-        }
-
-        appendTextNode(fragment, translatedText.slice(lastIndex, match.index));
-        const clone = link.cloneNode(false);
-        clone.textContent = stripPreserveMarkers(stripLinkMarkers(label)).trim() ||
-          normalizeText(link.innerText || link.textContent || "");
-        fragment.append(clone);
-        lastIndex = match.index + fullMatch.length;
-        matchedTokens += 1;
-        continue;
-      }
-
-      const preservedNode = preservedByToken.get(preserveToken);
-      if (!preservedNode) {
-        continue;
-      }
-
-      appendTextNode(fragment, translatedText.slice(lastIndex, match.index));
-      fragment.append(preservedNode.cloneNode(true));
-      lastIndex = match.index + fullMatch.length;
-      matchedTokens += 1;
-    }
+    const matchedTokens = appendTranslatedInline(fragment, translatedText, markerMaps);
 
     if (matchedTokens === 0) {
       return null;
     }
 
-    appendTextNode(fragment, translatedText.slice(lastIndex));
     return fragment;
   }
 
+  function appendTranslatedInline(parent, translatedText, markerMaps) {
+    const markerPattern = new RegExp(INLINE_MARKER_PATTERN.source, "g");
+    let lastIndex = 0;
+    let matchedTokens = 0;
+    let match;
+
+    while ((match = markerPattern.exec(translatedText))) {
+      const marker = match[1];
+
+      if (marker.startsWith("/")) {
+        appendTextNode(parent, translatedText.slice(lastIndex, match.index));
+        lastIndex = markerPattern.lastIndex;
+        continue;
+      }
+
+      appendTextNode(parent, translatedText.slice(lastIndex, match.index));
+
+      if (marker.startsWith(PRESERVE_TOKEN_PREFIX)) {
+        const preservedNode = markerMaps.preservedByToken.get(marker);
+        if (preservedNode) {
+          parent.append(preservedNode.cloneNode(true));
+          matchedTokens += 1;
+        }
+        lastIndex = markerPattern.lastIndex;
+        continue;
+      }
+
+      const closeMarker = `[[/${marker}]]`;
+      const contentStart = markerPattern.lastIndex;
+      const closeIndex = translatedText.indexOf(closeMarker, contentStart);
+
+      if (closeIndex === -1) {
+        lastIndex = markerPattern.lastIndex;
+        continue;
+      }
+
+      const content = translatedText.slice(contentStart, closeIndex);
+      const markerNode = createInlineMarkerNode(marker, content, markerMaps);
+
+      if (markerNode) {
+        parent.append(markerNode);
+        matchedTokens += 1;
+      } else {
+        appendTextNode(parent, content);
+      }
+
+      lastIndex = closeIndex + closeMarker.length;
+      markerPattern.lastIndex = lastIndex;
+    }
+
+    appendTextNode(parent, translatedText.slice(lastIndex));
+    return matchedTokens;
+  }
+
+  function createInlineMarkerNode(token, content, markerMaps) {
+    if (token.startsWith(LINK_TOKEN_PREFIX)) {
+      const link = markerMaps.linkByToken.get(token);
+      if (!link) {
+        return null;
+      }
+
+      const clone = link.cloneNode(false);
+      appendInlineContentOrFallback(
+        clone,
+        content,
+        markerMaps,
+        normalizeText(link.innerText || link.textContent || ""),
+      );
+      return clone;
+    }
+
+    if (token.startsWith(FORMAT_TOKEN_PREFIX)) {
+      const formatNode = markerMaps.formatByToken.get(token);
+      if (!formatNode) {
+        return null;
+      }
+
+      const clone = formatNode.cloneNode(false);
+      appendInlineContentOrFallback(
+        clone,
+        content,
+        markerMaps,
+        normalizeText(formatNode.innerText || formatNode.textContent || ""),
+      );
+      return clone;
+    }
+
+    return null;
+  }
+
+  function appendInlineContentOrFallback(parent, content, markerMaps, fallbackText) {
+    const fragment = document.createDocumentFragment();
+    appendTranslatedInline(fragment, content, markerMaps);
+
+    if (fragment.hasChildNodes()) {
+      parent.append(fragment);
+      return;
+    }
+
+    if (fallbackText) {
+      parent.append(document.createTextNode(fallbackText));
+    }
+  }
+
   function appendTextNode(fragment, text) {
-    const cleaned = stripPreserveMarkers(stripLinkMarkers(text));
+    const cleaned = stripInlineMarkers(text);
 
     if (cleaned) {
       fragment.append(document.createTextNode(cleaned));
@@ -1254,6 +1505,14 @@
 
   function stripPreserveMarkers(text) {
     return String(text || "").replace(ANY_PRESERVE_MARKER_PATTERN, "");
+  }
+
+  function stripFormatMarkers(text) {
+    return String(text || "").replace(ANY_FORMAT_MARKER_PATTERN, "");
+  }
+
+  function stripInlineMarkers(text) {
+    return stripFormatMarkers(stripPreserveMarkers(stripLinkMarkers(text)));
   }
 
   function restoreOriginals() {
