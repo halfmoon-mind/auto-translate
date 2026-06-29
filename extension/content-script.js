@@ -26,15 +26,9 @@
   ].join(",");
   const STRUCTURAL_UI_SELECTOR = [
     "header",
-    "nav",
-    "aside",
     "footer",
     "[role='banner']",
-    "[role='navigation']",
-    "[role='complementary']",
     "[role='contentinfo']",
-    "[data-left-nav]",
-    "[data-content-page-toc-rail]",
   ].join(",");
   const INTERACTIVE_SELECTOR = [
     "a",
