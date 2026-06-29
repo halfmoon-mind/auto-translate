@@ -5,9 +5,21 @@
   "description": "Translate visible page paragraphs into Korean through a local Codex native bridge.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0M92rykCUrZ0EbVXgQRMAvv1uz1/nQxFkosMZ5MFFJ64P1AEl7vTKJVJGK+ArzNFvvDEj53x3c31XJFJovJn4+gNswIpkKk/wuikPbfoF7T0kCtaKO4PW//Kpem4oA5PLzD3GtKNM1i+/gz9DE53qdfJMhhrar2FNU9V+nRy4GGub8mvMZCWL2PpOJxnveWyzn+oLjoICiSVhxhRLOW4XeAo2bIPSP4Fx0zgtUrq1m2Bc+JkFfsSbJQDpfYgou8z4qCOgH7yXy8E6Q3UoN2PMxiPaiRQmveXaLrWH6TntKWs0AVN8sfGBuEA71N0zxtk0fwFEntj8fS/EqLPcRWrlwIDAQAB",
   "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "action": {
     "default_title": "Codex 번역",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"

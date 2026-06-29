@@ -25,8 +25,10 @@
     "section div",
   ].join(",");
   const STRUCTURAL_UI_SELECTOR = [
-    "header",
-    "footer",
+    "body > header",
+    "body > footer",
+    "#header",
+    "#footer",
     "[role='banner']",
     "[role='contentinfo']",
   ].join(",");
@@ -224,7 +226,13 @@
       seen.add(element);
       const id = getOrCreateElementId(element, items.length + 1);
       const serialized = serializeCandidateText(element, text);
-      items.push({ id, element, text: serialized.text, links: serialized.links });
+      items.push({
+        id,
+        element,
+        kind: getTranslationKind(element),
+        text: serialized.text,
+        links: serialized.links,
+      });
     }
 
     return items;
@@ -234,6 +242,7 @@
     if (!document.body) {
       return [];
     }
+
     return Array.from(document.body.querySelectorAll(TRANSLATABLE_SELECTOR));
   }
 
@@ -250,6 +259,31 @@
     }
 
     return normalizeText(element.innerText || element.textContent || "");
+  }
+
+  function getTranslationKind(element) {
+    const tagName = element.tagName.toLowerCase();
+
+    if (/^h[1-6]$/.test(tagName)) {
+      return "heading";
+    }
+    if (tagName === "li") {
+      return "list_item";
+    }
+    if (tagName === "blockquote") {
+      return "quote";
+    }
+    if (tagName === "figcaption" || tagName === "caption") {
+      return "caption";
+    }
+    if (tagName === "th" || tagName === "td") {
+      return "table_cell";
+    }
+    if (tagName === "dt" || tagName === "dd") {
+      return "definition";
+    }
+
+    return "paragraph";
   }
 
   function isCandidateElement(element, text) {
@@ -375,7 +409,7 @@
     }
 
     for (const item of items.slice(0, MAX_CONTEXT_ITEMS)) {
-      context.push(item.text.slice(0, MAX_CONTEXT_SNIPPET_CHARS));
+      context.push(`${item.kind}: ${item.text.slice(0, MAX_CONTEXT_SNIPPET_CHARS)}`);
     }
 
     return context;
@@ -613,6 +647,7 @@
         },
         paragraphs: items.map((item) => ({
           id: item.id,
+          kind: item.kind,
           text: item.text,
         })),
       },
