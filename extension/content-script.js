@@ -114,6 +114,7 @@
   const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 40;
   const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 12000;
   const ESTIMATE_MAX_PARALLEL_RUNS = 3;
+  const MAX_RETRY_SPLIT_DEPTH = 6;
 
   const state = {
     inProgress: false,
@@ -161,7 +162,9 @@
         throw new Error("번역할 단락을 찾지 못했습니다.");
       }
 
-      metrics = estimateTranslationWork(items);
+      const prioritizedItems = prioritizeItems(items);
+      const batches = createTranslationBatches(prioritizedItems);
+      metrics = estimateTranslationWork(items, batches);
       const context = buildContext(items);
       const page = getPageInfo();
       publishStatus("translating", `${items.length}개 단락을 자동 번역 중입니다.`, 0, items.length, {
@@ -169,30 +172,26 @@
         metrics,
       });
 
-      const response = await sendRuntimeMessage({
-        type: "CODEX_LOCAL_TRANSLATE",
-        payload: {
-          page,
-          context,
-          paragraphs: items.map((item) => ({
-            id: item.id,
-            text: item.text,
-          })),
-        },
+      const result = await translateBatches({
+        batches,
+        page,
+        context,
+        startedAt,
+        metrics,
+        totalItems: items.length,
       });
 
-      if (!response?.ok) {
-        throw new Error(response?.error || "로컬 번역 서버 오류입니다.");
-      }
-
-      const translatedCount = applyTranslations(items, response.translations || []);
       const elapsedMs = Date.now() - startedAt;
-      publishStatus("done", `${translatedCount}개 단락을 번역했습니다.`, translatedCount, items.length, {
+      const message = result.failed
+        ? `${result.translated}개 단락을 번역했고 ${result.failed}개는 실패했습니다.`
+        : `${result.translated}개 단락을 번역했습니다.`;
+      publishStatus("done", message, result.translated + result.failed, items.length, {
         startedAt,
         elapsedMs,
         metrics,
+        failed: result.failed,
       });
-      return { ok: true, translated: translatedCount, elapsedMs, metrics };
+      return { ok: true, translated: result.translated, failed: result.failed, elapsedMs, metrics };
     } finally {
       state.inProgress = false;
     }
@@ -374,34 +373,68 @@
     return context;
   }
 
-  function estimateTranslationWork(items) {
-    let batchCount = 0;
-    let batchItems = 0;
-    let batchChars = 0;
-    let targetChars = 0;
+  function prioritizeItems(items) {
+    return items
+      .map((item, index) => ({ item, index, rank: getViewportRank(item.element) }))
+      .sort((left, right) => {
+        if (left.rank.group !== right.rank.group) {
+          return left.rank.group - right.rank.group;
+        }
+        if (left.rank.distance !== right.rank.distance) {
+          return left.rank.distance - right.rank.distance;
+        }
+        return left.index - right.index;
+      })
+      .map((entry) => entry.item);
+  }
+
+  function getViewportRank(element) {
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    const rect = element.getBoundingClientRect();
+
+    if (rect.bottom >= 0 && rect.top <= viewportHeight) {
+      return { group: 0, distance: Math.max(0, rect.top) };
+    }
+
+    if (rect.top > viewportHeight) {
+      return { group: 1, distance: rect.top - viewportHeight };
+    }
+
+    return { group: 2, distance: Math.abs(rect.bottom) };
+  }
+
+  function createTranslationBatches(items) {
+    const batches = [];
+    let batch = [];
+    let charCount = 0;
 
     for (const item of items) {
-      const textLength = item.text.length;
-      const nextBatchChars = batchChars + textLength;
+      const nextCharCount = charCount + item.text.length;
       const shouldStartNewBatch =
-        batchItems > 0 &&
-        (batchItems >= ESTIMATE_MAX_PARAGRAPHS_PER_RUN ||
-          nextBatchChars > ESTIMATE_MAX_TARGET_CHARS_PER_RUN);
+        batch.length > 0 &&
+        (batch.length >= ESTIMATE_MAX_PARAGRAPHS_PER_RUN ||
+          nextCharCount > ESTIMATE_MAX_TARGET_CHARS_PER_RUN);
 
       if (shouldStartNewBatch) {
-        batchCount += 1;
-        batchItems = 0;
-        batchChars = 0;
+        batches.push(batch);
+        batch = [];
+        charCount = 0;
       }
 
-      batchItems += 1;
-      batchChars += textLength;
-      targetChars += textLength;
+      batch.push(item);
+      charCount += item.text.length;
     }
 
-    if (batchItems > 0) {
-      batchCount += 1;
+    if (batch.length > 0) {
+      batches.push(batch);
     }
+
+    return batches;
+  }
+
+  function estimateTranslationWork(items, batches) {
+    const targetChars = items.reduce((sum, item) => sum + item.text.length, 0);
+    const batchCount = batches.length;
 
     const parallelRuns = Math.min(ESTIMATE_MAX_PARALLEL_RUNS, batchCount || 1);
 
@@ -412,6 +445,131 @@
       parallelRuns,
       waveCount: Math.ceil(batchCount / parallelRuns),
     };
+  }
+
+  async function translateBatches({ batches, page, context, startedAt, metrics, totalItems }) {
+    const progress = { translated: 0, failed: 0, firstError: null };
+
+    await mapWithConcurrency(batches, ESTIMATE_MAX_PARALLEL_RUNS, async (batch, index) => {
+      await translateBatchWithRetry({
+        batch,
+        page,
+        context,
+        index,
+        totalBatches: batches.length,
+        startedAt,
+        metrics,
+        totalItems,
+        progress,
+        depth: 0,
+      });
+    });
+
+    if (progress.translated === 0 && progress.failed > 0) {
+      throw new Error(
+        progress.firstError
+          ? `모든 번역 배치가 실패했습니다. ${progress.firstError}`
+          : "모든 번역 배치가 실패했습니다.",
+      );
+    }
+
+    return progress;
+  }
+
+  async function mapWithConcurrency(items, concurrency, mapper) {
+    let nextIndex = 0;
+    const workerCount = Math.min(concurrency, items.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        await mapper(items[index], index);
+      }
+    });
+
+    await Promise.all(workers);
+  }
+
+  async function translateBatchWithRetry(options) {
+    const { batch, depth } = options;
+
+    try {
+      const translations = await requestTranslationBatch(options);
+      const translated = applyTranslations(batch, translations);
+      recordTranslationProgress(options, translated, batch.length - translated);
+      return;
+    } catch (error) {
+      if (batch.length > 1 && depth < MAX_RETRY_SPLIT_DEPTH && shouldSplitRetry(error)) {
+        const midpoint = Math.ceil(batch.length / 2);
+        await translateBatchWithRetry({
+          ...options,
+          batch: batch.slice(0, midpoint),
+          depth: depth + 1,
+        });
+        await translateBatchWithRetry({
+          ...options,
+          batch: batch.slice(midpoint),
+          depth: depth + 1,
+        });
+        return;
+      }
+
+      console.warn("Codex translation batch failed.", error);
+      options.progress.firstError ||= getErrorMessage(error);
+      recordTranslationProgress(options, 0, batch.length);
+    }
+  }
+
+  async function requestTranslationBatch({ batch, page, context, index, totalBatches }) {
+    const response = await sendRuntimeMessage({
+      type: "CODEX_LOCAL_TRANSLATE",
+      payload: {
+        page,
+        context,
+        batch: {
+          index: index + 1,
+          total: totalBatches,
+        },
+        paragraphs: batch.map((item) => ({
+          id: item.id,
+          text: item.text,
+        })),
+      },
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "로컬 번역 서버 오류입니다.");
+    }
+
+    return response.translations || [];
+  }
+
+  function shouldSplitRetry(error) {
+    const message = getErrorMessage(error).toLowerCase();
+    return (
+      !message.includes("failed to fetch") &&
+      !message.includes("local server responded") &&
+      !message.includes("not logged in") &&
+      !message.includes("log in") &&
+      !message.includes("unauthorized") &&
+      !message.includes("authentication")
+    );
+  }
+
+  function recordTranslationProgress({ progress, startedAt, metrics, totalItems }, translated, failed) {
+    progress.translated += translated;
+    progress.failed += failed;
+
+    const completed = progress.translated + progress.failed;
+    const message = progress.failed
+      ? `${progress.translated}개 번역 완료, ${progress.failed}개 실패했습니다.`
+      : `${progress.translated}개 단락을 번역 중입니다.`;
+
+    publishStatus("translating", message, completed, totalItems, {
+      startedAt,
+      metrics,
+      failed: progress.failed,
+    });
   }
 
   function getPageInfo() {

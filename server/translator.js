@@ -3,7 +3,7 @@ const { spawn } = require("node:child_process");
 
 const CODEX_BIN = process.env.CODEX_TRANSLATOR_CODEX_BIN || "codex";
 const DEFAULT_MODEL = "gpt-5.3-codex-spark";
-const DEFAULT_EFFORT = "low";
+const DEFAULT_EFFORT = "medium";
 const MODEL = process.env.CODEX_TRANSLATOR_MODEL ?? DEFAULT_MODEL;
 const EFFORT = normalizeEffort(process.env.CODEX_TRANSLATOR_EFFORT || DEFAULT_EFFORT);
 const TIMEOUT_MS = Number.parseInt(
@@ -327,7 +327,7 @@ function runCodex(prompt) {
 }
 
 function normalizeEffort(value) {
-  const normalized = String(value || "low").trim().toLowerCase();
+  const normalized = String(value || DEFAULT_EFFORT).trim().toLowerCase();
   if (normalized === "fast") {
     return "low";
   }
