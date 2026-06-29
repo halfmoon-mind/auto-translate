@@ -6,7 +6,7 @@ Personal Chrome extension that translates visible web-page paragraphs into Korea
 
 - This is for local personal use, not public distribution.
 - Codex CLI is installed and logged in with ChatGPT: `codex login`.
-- Translation uses the Spark fast profile, automatic page splitting, and limited parallelism for better speed.
+- Translation uses a low-effort model profile, automatic page splitting, and limited parallelism for better speed.
 - Chrome launches the native host on demand while translating.
 
 ## Run
@@ -33,17 +33,17 @@ Chrome starts the native host only while it is handling a health check or transl
 The native bridge defaults prioritize speed:
 
 ```sh
-CODEX_TRANSLATOR_MODEL=gpt-5.3-codex-spark
-CODEX_TRANSLATOR_EFFORT=medium
+CODEX_TRANSLATOR_MODEL=gpt-5.4-mini
+CODEX_TRANSLATOR_EFFORT=low
 CODEX_TRANSLATOR_TIMEOUT_MS=180000
 CODEX_TRANSLATOR_MAX_CONTEXT_CHARS=6000
-CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN=40
-CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN=12000
-CODEX_TRANSLATOR_MAX_PARALLEL_RUNS=3
+CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN=20
+CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN=7000
+CODEX_TRANSLATOR_MAX_PARALLEL_RUNS=4
 ```
 
 Set `CODEX_TRANSLATOR_MODEL=` to let Codex use its default model.
-Set `CODEX_TRANSLATOR_MODEL=gpt-5.4-mini` if you want the previous, steadier model.
+Set `CODEX_TRANSLATOR_MODEL=gpt-5.3-codex-spark` if you have Spark quota and want the faster profile.
 `CODEX_TRANSLATOR_EFFORT=fast` is accepted as an alias for Codex's `low` reasoning effort.
 
 ## API-Key Avoidance

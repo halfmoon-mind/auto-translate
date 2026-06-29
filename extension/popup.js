@@ -8,6 +8,9 @@ const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs";
 const FALLBACK_WAVE_MS_MIN = 30000;
 const FALLBACK_WAVE_MS_MAX = 75000;
 
+let hasRenderedStatus = false;
+let activeTabId = null;
+
 const elapsedState = {
   intervalId: null,
   startedAt: null,
@@ -27,13 +30,38 @@ function init() {
     runOnActiveTab("CODEX_RESTORE_PAGE");
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender) => {
     if (message?.type === "CODEX_TRANSLATION_STATUS") {
+      if (!shouldRenderStatusFromSender(sender)) {
+        return;
+      }
+
       renderStatus(message.status);
     }
   });
 
+  restoreLastStatus();
   checkServerHealth();
+}
+
+async function restoreLastStatus() {
+  try {
+    const [tab] = await queryTabs({ active: true, currentWindow: true });
+
+    if (!tab?.id) {
+      return;
+    }
+
+    activeTabId = tab.id;
+    await ensureContentScript(tab.id);
+    const response = await sendTabMessage(tab.id, { type: "CODEX_GET_TRANSLATION_STATUS" });
+
+    if (response?.ok && response.status) {
+      renderStatus(response.status);
+    }
+  } catch {
+    // Some pages cannot run content scripts; the popup can still show bridge health.
+  }
 }
 
 async function checkServerHealth() {
@@ -47,7 +75,9 @@ async function checkServerHealth() {
     serverStatus.textContent = `로컬 브리지 / ${response.model} / ${response.effort}`;
   } catch (error) {
     serverStatus.textContent = "로컬 브리지 연결 실패";
-    statusText.textContent = getErrorMessage(error);
+    if (!hasRenderedStatus) {
+      statusText.textContent = getErrorMessage(error);
+    }
   }
 }
 
@@ -65,6 +95,7 @@ async function runOnActiveTab(type, options = {}) {
       throw new Error("활성 탭을 찾지 못했습니다.");
     }
 
+    activeTabId = tab.id;
     await ensureContentScript(tab.id);
     const response = await sendTabMessage(tab.id, { type, options });
 
@@ -76,7 +107,7 @@ async function runOnActiveTab(type, options = {}) {
       clearElapsedTimer("경과 시간 대기");
       statusText.textContent = `${response.restored || 0}개 단락을 복원했습니다.`;
     } else if (type === "CODEX_TRANSLATE_PAGE") {
-      finishElapsedTimer(response.elapsedMs, response.metrics);
+      finishElapsedTimer(response.elapsedMs, response.metrics, "소요", response.usage);
     }
   } catch (error) {
     if (type === "CODEX_TRANSLATE_PAGE") {
@@ -99,11 +130,17 @@ async function ensureContentScript(tabId) {
   }
 }
 
+function shouldRenderStatusFromSender(sender) {
+  const senderTabId = sender?.tab?.id;
+  return !Number.isFinite(senderTabId) || activeTabId === null || senderTabId === activeTabId;
+}
+
 function renderStatus(status) {
   if (!status?.message) {
     return;
   }
 
+  hasRenderedStatus = true;
   updateElapsedFromStatus(status);
 
   if (Number.isFinite(status.current) && Number.isFinite(status.total)) {
@@ -121,7 +158,12 @@ function updateElapsedFromStatus(status) {
   }
 
   if (status.phase === "done") {
-    finishElapsedTimer(status.elapsedMs, status.metrics);
+    finishElapsedTimer(status.elapsedMs, status.metrics, "소요", status.usage);
+    return;
+  }
+
+  if (status.phase === "failed") {
+    finishElapsedTimer(status.elapsedMs, status.metrics, "실패", status.usage);
     return;
   }
 
@@ -148,7 +190,7 @@ function startElapsedTimer(startedAt, status) {
   renderElapsedText();
 }
 
-function finishElapsedTimer(elapsedMs, metrics, label = "소요") {
+function finishElapsedTimer(elapsedMs, metrics, label = "소요", usage = null) {
   if (elapsedState.intervalId) {
     clearInterval(elapsedState.intervalId);
     elapsedState.intervalId = null;
@@ -165,6 +207,7 @@ function finishElapsedTimer(elapsedMs, metrics, label = "소요") {
     ...(elapsedState.lastStatus || {}),
     phase: label === "소요" ? "done" : "stopped",
     metrics: metrics || elapsedState.lastStatus?.metrics,
+    usage: usage || elapsedState.lastStatus?.usage,
     finalLabel: label,
   };
 
@@ -216,6 +259,11 @@ function renderElapsedText() {
     parts.push(work);
   }
 
+  const usage = formatUsage(status.usage);
+  if (usage) {
+    parts.push(usage);
+  }
+
   elapsedText.textContent = parts.join(" · ");
 }
 
@@ -241,6 +289,77 @@ function formatWork(metrics) {
 
   const parallelRuns = Number.isFinite(metrics.parallelRuns) ? metrics.parallelRuns : 1;
   return `배치 ${metrics.batchCount}개 / 동시 ${parallelRuns}개`;
+}
+
+function formatUsage(usage) {
+  const normalizedUsage = normalizeUsage(usage);
+  if (!normalizedUsage) {
+    return "";
+  }
+
+  const label = normalizedUsage.estimated ? "추정" : "사용";
+  const cost = formatCost(normalizedUsage.costUsd);
+  return cost
+    ? `${label} ${formatTokenCount(normalizedUsage.totalTokens)}토큰 / API 환산 약 ${cost}`
+    : `${label} ${formatTokenCount(normalizedUsage.totalTokens)}토큰`;
+}
+
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+
+  const inputTokens = readTokenCount(usage.inputTokens);
+  const outputTokens = readTokenCount(usage.outputTokens);
+  const totalTokens = readTokenCount(usage.totalTokens) || inputTokens + outputTokens;
+
+  if (!totalTokens) {
+    return null;
+  }
+
+  return {
+    totalTokens,
+    costUsd: readOptionalNumber(usage.costUsd),
+    estimated: usage.estimated !== false,
+  };
+}
+
+function readTokenCount(value) {
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+function readOptionalNumber(value) {
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function formatCost(value) {
+  if (!Number.isFinite(value)) {
+    return "";
+  }
+
+  if (value < 0.01) {
+    return `$${value.toFixed(4)}`;
+  }
+
+  return `$${value.toFixed(2)}`;
+}
+
+function formatTokenCount(value) {
+  const rounded = Math.max(1, Math.round(value));
+
+  if (rounded >= 1000000) {
+    return `${trimTrailingZero((rounded / 1000000).toFixed(1))}M`;
+  }
+
+  if (rounded >= 1000) {
+    return `${trimTrailingZero((rounded / 1000).toFixed(1))}k`;
+  }
+
+  return rounded.toLocaleString("ko-KR");
+}
+
+function trimTrailingZero(value) {
+  return value.replace(/\.0$/, "");
 }
 
 function recordElapsedSample(metrics, elapsedMs) {

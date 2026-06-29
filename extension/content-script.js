@@ -113,20 +113,34 @@
   const TRANSLATED_CLASS = "codex-context-translator-translated";
   const STYLE_ID = "codex-context-translator-style";
   const INLINE_LINK_SELECTOR = "a[href]";
+  const INLINE_PRESERVE_SELECTOR = [
+    "span.math",
+    ".math",
+    "mjx-container",
+    ".MathJax",
+    ".MathJax_Display",
+    ".katex",
+    "math",
+  ].join(",");
   const LINK_TOKEN_PREFIX = "CTX-LINK-";
-  const LINK_MARKER_PATTERN = /\[\[(CTX-LINK-\d+)\]\]([\s\S]*?)\[\[\/\1\]\]/g;
+  const PRESERVE_TOKEN_PREFIX = "CTX-PRESERVE-";
+  const INLINE_MARKER_PATTERN = /\[\[(CTX-LINK-\d+)\]\]([\s\S]*?)\[\[\/\1\]\]|\[\[(CTX-PRESERVE-\d+)\]\]/g;
   const ANY_LINK_MARKER_PATTERN = /\[\[\/?CTX-LINK-\d+\]\]/g;
+  const ANY_PRESERVE_MARKER_PATTERN = /\[\[CTX-PRESERVE-\d+\]\]/g;
   const MAX_CONTEXT_ITEMS = 40;
   const MAX_CONTEXT_SNIPPET_CHARS = 180;
-  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 40;
-  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 12000;
-  const ESTIMATE_MAX_PARALLEL_RUNS = 3;
+  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 20;
+  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 7000;
+  const ESTIMATE_MAX_PARALLEL_RUNS = 4;
+  const PRIORITY_BATCH_MAX_PARAGRAPHS = 8;
+  const PRIORITY_BATCH_MAX_TARGET_CHARS = 2500;
   const MAX_RETRY_SPLIT_DEPTH = 6;
   const MAX_TRANSLATION_CACHE_ENTRIES = 500;
   const QUALITY_ERROR_PREFIX = "번역 품질 검증 실패";
 
   const state = {
     inProgress: false,
+    lastStatus: null,
     originals: new Map(),
     translationCache: new Map(),
   };
@@ -134,6 +148,11 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "CODEX_TRANSLATOR_PING") {
       sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === "CODEX_GET_TRANSLATION_STATUS") {
+      sendResponse({ ok: true, status: state.lastStatus });
       return false;
     }
 
@@ -199,9 +218,24 @@
         startedAt,
         elapsedMs,
         metrics,
+        usage: result.usage,
         failed: result.failed,
       });
-      return { ok: true, translated: result.translated, failed: result.failed, elapsedMs, metrics };
+      return {
+        ok: true,
+        translated: result.translated,
+        failed: result.failed,
+        elapsedMs,
+        metrics,
+        usage: result.usage,
+      };
+    } catch (error) {
+      publishStatus("failed", getErrorMessage(error), null, null, {
+        startedAt,
+        elapsedMs: Date.now() - startedAt,
+        metrics,
+      });
+      throw error;
     } finally {
       state.inProgress = false;
     }
@@ -223,15 +257,20 @@
         continue;
       }
 
+      const serialized = serializeCandidateText(element, text);
+      if (isPreserveOnlyText(serialized.text)) {
+        continue;
+      }
+
       seen.add(element);
       const id = getOrCreateElementId(element, items.length + 1);
-      const serialized = serializeCandidateText(element, text);
       items.push({
         id,
         element,
         kind: getTranslationKind(element),
         text: serialized.text,
         links: serialized.links,
+        preservedNodes: serialized.preservedNodes,
       });
     }
 
@@ -295,7 +334,7 @@
       return false;
     }
 
-    if (element.querySelector(BLOCKING_DESCENDANT_SELECTOR)) {
+    if (hasBlockingDescendant(element)) {
       return false;
     }
 
@@ -315,24 +354,26 @@
 
   function serializeCandidateText(element, fallbackText) {
     const links = [];
+    const preservedNodes = [];
 
-    if (!element.querySelector(INLINE_LINK_SELECTOR)) {
-      return { text: fallbackText, links };
+    if (!element.querySelector(`${INLINE_LINK_SELECTOR},${INLINE_PRESERVE_SELECTOR}`)) {
+      return { text: fallbackText, links, preservedNodes };
     }
 
     const text = normalizeText(
       Array.from(element.childNodes)
-        .map((node) => serializeNodeText(node, links))
+        .map((node) => serializeNodeText(node, links, preservedNodes))
         .join(" "),
     );
 
     return {
       text: text || fallbackText,
       links,
+      preservedNodes,
     };
   }
 
-  function serializeNodeText(node, links) {
+  function serializeNodeText(node, links, preservedNodes) {
     if (node.nodeType === Node.TEXT_NODE) {
       return node.textContent || "";
     }
@@ -350,13 +391,25 @@
       return `[[${token}]]${text}[[/${token}]]`;
     }
 
+    if (element.matches(INLINE_PRESERVE_SELECTOR)) {
+      const token = `${PRESERVE_TOKEN_PREFIX}${preservedNodes.length + 1}`;
+      preservedNodes.push({ token, element });
+      return `[[${token}]]`;
+    }
+
     if (element.closest(EXCLUDED_ANCESTOR_SELECTOR)) {
       return "";
     }
 
     return Array.from(element.childNodes)
-      .map((child) => serializeNodeText(child, links))
+      .map((child) => serializeNodeText(child, links, preservedNodes))
       .join(" ");
+  }
+
+  function hasBlockingDescendant(element) {
+    return Array.from(element.querySelectorAll(BLOCKING_DESCENDANT_SELECTOR)).some(
+      (descendant) => !descendant.closest(INLINE_PRESERVE_SELECTOR),
+    );
   }
 
   function isVisible(element) {
@@ -376,6 +429,10 @@
   function isMostlyNonText(text) {
     const letters = text.match(/[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/g) || [];
     return letters.length < 2;
+  }
+
+  function isPreserveOnlyText(text) {
+    return isMostlyNonText(stripPreserveMarkers(stripLinkMarkers(text)));
   }
 
   function isMostlyKorean(text) {
@@ -427,11 +484,11 @@
         if (left.viewportRank.group !== right.viewportRank.group) {
           return left.viewportRank.group - right.viewportRank.group;
         }
-        if (left.contentRank !== right.contentRank) {
-          return left.contentRank - right.contentRank;
-        }
         if (left.viewportRank.distance !== right.viewportRank.distance) {
           return left.viewportRank.distance - right.viewportRank.distance;
+        }
+        if (left.contentRank !== right.contentRank) {
+          return left.contentRank - right.contentRank;
         }
         return left.index - right.index;
       })
@@ -472,10 +529,11 @@
 
     for (const item of items) {
       const nextCharCount = charCount + item.text.length;
+      const limits = getBatchLimits(batches.length);
       const shouldStartNewBatch =
         batch.length > 0 &&
-        (batch.length >= ESTIMATE_MAX_PARAGRAPHS_PER_RUN ||
-          nextCharCount > ESTIMATE_MAX_TARGET_CHARS_PER_RUN);
+        (batch.length >= limits.maxParagraphs ||
+          nextCharCount > limits.maxTargetChars);
 
       if (shouldStartNewBatch) {
         batches.push(batch);
@@ -494,30 +552,61 @@
     return batches;
   }
 
+  function getBatchLimits(batchIndex) {
+    if (batchIndex === 0) {
+      return {
+        maxParagraphs: PRIORITY_BATCH_MAX_PARAGRAPHS,
+        maxTargetChars: PRIORITY_BATCH_MAX_TARGET_CHARS,
+      };
+    }
+
+    return {
+      maxParagraphs: ESTIMATE_MAX_PARAGRAPHS_PER_RUN,
+      maxTargetChars: ESTIMATE_MAX_TARGET_CHARS_PER_RUN,
+    };
+  }
+
   function estimateTranslationWork(items, batches) {
     const targetChars = items.reduce((sum, item) => sum + item.text.length, 0);
     const batchCount = batches.length;
-
-    const parallelRuns = Math.min(ESTIMATE_MAX_PARALLEL_RUNS, batchCount || 1);
+    const parallelRuns = Math.min(ESTIMATE_MAX_PARALLEL_RUNS, Math.max(1, batchCount - 1));
+    const waveCount = batchCount > 1
+      ? 1 + Math.ceil((batchCount - 1) / parallelRuns)
+      : batchCount;
 
     return {
       targetCount: items.length,
       targetChars,
       batchCount,
       parallelRuns,
-      waveCount: Math.ceil(batchCount / parallelRuns),
+      waveCount,
     };
   }
 
   async function translateBatches({ batches, page, context, startedAt, metrics, totalItems }) {
-    const progress = { translated: 0, failed: 0, firstError: null };
+    const progress = { translated: 0, failed: 0, firstError: null, usage: null };
 
-    await mapWithConcurrency(batches, ESTIMATE_MAX_PARALLEL_RUNS, async (batch, index) => {
+    if (batches.length > 0) {
+      await translateBatchWithRetry({
+        batch: batches[0],
+        page,
+        context,
+        index: 0,
+        totalBatches: batches.length,
+        startedAt,
+        metrics,
+        totalItems,
+        progress,
+        depth: 0,
+      });
+    }
+
+    await mapWithConcurrency(batches.slice(1), ESTIMATE_MAX_PARALLEL_RUNS, async (batch, index) => {
       await translateBatchWithRetry({
         batch,
         page,
         context,
-        index,
+        index: index + 1,
         totalBatches: batches.length,
         startedAt,
         metrics,
@@ -556,7 +645,9 @@
     const { batch, depth } = options;
 
     try {
-      const translations = await requestTranslationBatch(options);
+      const result = await requestTranslationBatch(options);
+      addUsage(options.progress, result.usage);
+      const translations = result.translations;
       const translated = applyTranslations(batch, translations);
       recordTranslationProgress(options, translated, batch.length - translated);
       return;
@@ -599,18 +690,20 @@
 
     const uniqueItems = getUniqueTranslationItems(uncachedItems);
     const fetchedByKey = new Map();
+    let usage = null;
 
     if (uniqueItems.length > 0) {
-      const translations = await fetchTranslations({
+      const result = await fetchTranslations({
         items: uniqueItems,
         page,
         context,
         index,
         totalBatches,
       });
+      usage = result.usage;
 
       for (const item of uniqueItems) {
-        const translatedText = translations.get(item.id);
+        const translatedText = result.translations.get(item.id);
         const sourceKey = getTranslationSourceKey(item);
 
         fetchedByKey.set(sourceKey, translatedText);
@@ -632,7 +725,7 @@
       translations.push({ id: item.id, text: translatedText });
     }
 
-    return translations;
+    return { translations, usage };
   }
 
   async function fetchTranslations({ items, page, context, index, totalBatches }) {
@@ -657,7 +750,72 @@
       throw new Error(response?.error || "로컬 번역 브리지 오류입니다.");
     }
 
-    return normalizeTranslationResponse(items, response.translations || []);
+    return {
+      translations: normalizeTranslationResponse(items, response.translations || []),
+      usage: response.usage || null,
+    };
+  }
+
+  function addUsage(progress, usage) {
+    const normalizedUsage = normalizeUsage(usage);
+    if (!normalizedUsage) {
+      return;
+    }
+
+    progress.usage = sumUsage(progress.usage, normalizedUsage);
+  }
+
+  function sumUsage(current, next) {
+    if (!current) {
+      return { ...next };
+    }
+
+    return {
+      inputTokens: current.inputTokens + next.inputTokens,
+      outputTokens: current.outputTokens + next.outputTokens,
+      totalTokens: current.totalTokens + next.totalTokens,
+      costUsd: sumOptionalNumbers(current.costUsd, next.costUsd),
+      costBasis: current.costBasis || next.costBasis || null,
+      estimated: current.estimated || next.estimated,
+    };
+  }
+
+  function normalizeUsage(usage) {
+    if (!usage || typeof usage !== "object") {
+      return null;
+    }
+
+    const inputTokens = readTokenCount(usage.inputTokens);
+    const outputTokens = readTokenCount(usage.outputTokens);
+    const totalTokens = readTokenCount(usage.totalTokens);
+
+    if (!inputTokens && !outputTokens && !totalTokens) {
+      return null;
+    }
+
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens: totalTokens || inputTokens + outputTokens,
+      costUsd: readOptionalNumber(usage.costUsd),
+      costBasis: usage.costBasis && typeof usage.costBasis === "object" ? usage.costBasis : null,
+      estimated: usage.estimated !== false,
+    };
+  }
+
+  function readTokenCount(value) {
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+  }
+
+  function readOptionalNumber(value) {
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function sumOptionalNumbers(left, right) {
+    const safeLeft = Number.isFinite(left) ? left : 0;
+    const safeRight = Number.isFinite(right) ? right : 0;
+
+    return safeLeft || safeRight ? safeLeft + safeRight : null;
   }
 
   function normalizeTranslationResponse(items, translations) {
@@ -766,8 +924,15 @@
       );
     }
 
-    const sourceText = stripLinkMarkers(item.text);
-    const targetText = stripLinkMarkers(text);
+    const missingPreserveTokens = getMissingPreserveTokens(item, text);
+    if (missingPreserveTokens.length > 0) {
+      throw new Error(
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 보존 마커가 누락되었습니다 (${missingPreserveTokens.join(", ")}).`,
+      );
+    }
+
+    const sourceText = stripPreserveMarkers(stripLinkMarkers(item.text));
+    const targetText = stripPreserveMarkers(stripLinkMarkers(text));
     const missingUrls = getMissingPreservedTokens(extractUrls(sourceText), targetText);
 
     if (missingUrls.length > 0) {
@@ -790,6 +955,18 @@
         !translatedText.includes(`[[/${link.token}]]`)
       ) {
         missing.push(link.token);
+      }
+    }
+
+    return missing;
+  }
+
+  function getMissingPreserveTokens(item, translatedText) {
+    const missing = [];
+
+    for (const preservedNode of item.preservedNodes || []) {
+      if (!translatedText.includes(`[[${preservedNode.token}]]`)) {
+        missing.push(preservedNode.token);
       }
     }
 
@@ -851,6 +1028,7 @@
     publishStatus("translating", message, completed, totalItems, {
       startedAt,
       metrics,
+      usage: progress.usage,
       failed: progress.failed,
     });
   }
@@ -896,45 +1074,66 @@
   }
 
   function applyTranslationText(item, translatedText) {
-    const fragment = buildLinkedTranslationFragment(translatedText, item.links || []);
+    const fragment = buildTranslationFragment(
+      translatedText,
+      item.links || [],
+      item.preservedNodes || [],
+    );
 
     if (fragment) {
       item.element.replaceChildren(fragment);
       return;
     }
 
-    item.element.textContent = stripLinkMarkers(translatedText);
+    item.element.textContent = stripPreserveMarkers(stripLinkMarkers(translatedText));
   }
 
-  function buildLinkedTranslationFragment(translatedText, links) {
-    if (!links.length) {
+  function buildTranslationFragment(translatedText, links, preservedNodes) {
+    if (!links.length && !preservedNodes.length) {
       return null;
     }
 
     const linkByToken = new Map(links.map((link) => [link.token, link.element]));
+    const preservedByToken = new Map(
+      preservedNodes.map((preservedNode) => [preservedNode.token, preservedNode.element]),
+    );
     const fragment = document.createDocumentFragment();
     let lastIndex = 0;
-    let matchedLinks = 0;
+    let matchedTokens = 0;
     let match;
 
-    LINK_MARKER_PATTERN.lastIndex = 0;
-    while ((match = LINK_MARKER_PATTERN.exec(translatedText))) {
-      const [fullMatch, token, label] = match;
-      const link = linkByToken.get(token);
+    INLINE_MARKER_PATTERN.lastIndex = 0;
+    while ((match = INLINE_MARKER_PATTERN.exec(translatedText))) {
+      const [fullMatch, linkToken, label, preserveToken] = match;
 
-      if (!link) {
+      if (linkToken) {
+        const link = linkByToken.get(linkToken);
+        if (!link) {
+          continue;
+        }
+
+        appendTextNode(fragment, translatedText.slice(lastIndex, match.index));
+        const clone = link.cloneNode(false);
+        clone.textContent = stripPreserveMarkers(stripLinkMarkers(label)).trim() ||
+          normalizeText(link.innerText || link.textContent || "");
+        fragment.append(clone);
+        lastIndex = match.index + fullMatch.length;
+        matchedTokens += 1;
+        continue;
+      }
+
+      const preservedNode = preservedByToken.get(preserveToken);
+      if (!preservedNode) {
         continue;
       }
 
       appendTextNode(fragment, translatedText.slice(lastIndex, match.index));
-      const clone = link.cloneNode(false);
-      clone.textContent = stripLinkMarkers(label).trim() || normalizeText(link.innerText || link.textContent || "");
-      fragment.append(clone);
+      fragment.append(preservedNode.cloneNode(true));
       lastIndex = match.index + fullMatch.length;
-      matchedLinks += 1;
+      matchedTokens += 1;
     }
 
-    if (matchedLinks === 0) {
+    if (matchedTokens === 0) {
       return null;
     }
 
@@ -943,7 +1142,7 @@
   }
 
   function appendTextNode(fragment, text) {
-    const cleaned = stripLinkMarkers(text);
+    const cleaned = stripPreserveMarkers(stripLinkMarkers(text));
 
     if (cleaned) {
       fragment.append(document.createTextNode(cleaned));
@@ -952,6 +1151,10 @@
 
   function stripLinkMarkers(text) {
     return String(text || "").replace(ANY_LINK_MARKER_PATTERN, "");
+  }
+
+  function stripPreserveMarkers(text) {
+    return String(text || "").replace(ANY_PRESERVE_MARKER_PATTERN, "");
   }
 
   function restoreOriginals() {
@@ -999,11 +1202,14 @@
   }
 
   function publishStatus(phase, message, current = null, total = null, extra = {}) {
+    const status = { phase, message, current, total, ...extra };
+    state.lastStatus = status;
+
     try {
       chrome.runtime.sendMessage(
         {
           type: "CODEX_TRANSLATION_STATUS",
-          status: { phase, message, current, total, ...extra },
+          status,
         },
         () => {
           void chrome.runtime.lastError;

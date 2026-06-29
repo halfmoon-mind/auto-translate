@@ -1,0 +1,27 @@
+{
+  "source": {
+    "title": "OpenAI API pricing",
+    "url": "https://platform.openai.com/docs/pricing",
+    "retrievedAt": "2026-06-29",
+    "notes": "Local snapshot of only the token prices needed by this translator. Prices are USD per 1M tokens for the Standard tier."
+  },
+  "unit": "usd_per_1m_tokens",
+  "tier": "standard",
+  "models": {
+    "gpt-5.4-mini": {
+      "basisModel": "gpt-5.4-mini",
+      "input": 0.75,
+      "cachedInput": 0.075,
+      "output": 4.5
+    },
+    "gpt-5.3-codex": {
+      "basisModel": "gpt-5.3-codex",
+      "input": 1.75,
+      "cachedInput": 0.175,
+      "output": 14
+    }
+  },
+  "aliases": {
+    "gpt-5.3-codex-spark": "gpt-5.3-codex"
+  }
+}

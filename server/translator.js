@@ -1,9 +1,10 @@
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const PRICING_SNAPSHOT = require("./openai-pricing-snapshot.json");
 
 const CODEX_BIN = process.env.CODEX_TRANSLATOR_CODEX_BIN || "codex";
-const DEFAULT_MODEL = "gpt-5.3-codex-spark";
-const DEFAULT_EFFORT = "medium";
+const DEFAULT_MODEL = "gpt-5.4-mini";
+const DEFAULT_EFFORT = "low";
 const MODEL = process.env.CODEX_TRANSLATOR_MODEL ?? DEFAULT_MODEL;
 const EFFORT = normalizeEffort(process.env.CODEX_TRANSLATOR_EFFORT || DEFAULT_EFFORT);
 const TIMEOUT_MS = Number.parseInt(
@@ -15,16 +16,16 @@ const MAX_CONTEXT_CHARS = Number.parseInt(
   10,
 );
 const MAX_PARAGRAPHS_PER_RUN = Number.parseInt(
-  process.env.CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN || "40",
+  process.env.CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN || "20",
   10,
 );
 const MAX_TARGET_CHARS_PER_RUN = Number.parseInt(
-  process.env.CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN || "12000",
+  process.env.CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN || "7000",
   10,
 );
 const MAX_PARALLEL_RUNS = Math.min(
   4,
-  Math.max(1, Number.parseInt(process.env.CODEX_TRANSLATOR_MAX_PARALLEL_RUNS || "3", 10) || 3),
+  Math.max(1, Number.parseInt(process.env.CODEX_TRANSLATOR_MAX_PARALLEL_RUNS || "4", 10) || 4),
 );
 const MAX_STDIO_BYTES = 2 * 1024 * 1024;
 const SCHEMA_PATH = path.join(__dirname, "translation-schema.json");
@@ -166,6 +167,7 @@ function buildPrompt(request) {
     "Keep terminology consistent across the batch and context. Avoid mixing Korean alternatives for the same source term.",
     "Preserve ids exactly. Preserve URLs, numbers, code identifiers, file paths, slash commands, model/API names, and product names unless a Korean equivalent is standard.",
     "If a target contains inline link markers like [[CTX-LINK-1]]...[[/CTX-LINK-1]], keep those marker tokens exactly and translate the linked label between them.",
+    "If a target contains inline preserve markers like [[CTX-PRESERVE-1]], keep each marker token exactly once and treat it as an untranslated formula or inline object.",
     "Return only JSON that matches the provided output schema.",
     "",
     "Input JSON:",
@@ -185,13 +187,18 @@ async function translateRequest(request) {
       paragraphs,
     });
     const codexResult = await runCodex(prompt);
+    const translations = normalizeTranslations(codexResult, paragraphs);
 
-    return normalizeTranslations(codexResult, paragraphs);
+    return {
+      translations,
+      usage: estimateUsage(prompt, translations),
+    };
   });
 
   return {
-    translations: batchResults.flat(),
+    translations: batchResults.flatMap((result) => result.translations),
     runs: batches.length,
+    usage: sumUsage(batchResults.map((result) => result.usage)),
   };
 }
 
@@ -422,6 +429,71 @@ function stripCodeFence(value) {
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
+}
+
+function estimateUsage(prompt, translations) {
+  const outputText = JSON.stringify({ translations });
+  const inputTokens = estimateTokenCount(prompt);
+  const outputTokens = estimateTokenCount(outputText);
+  const cost = estimateCost(inputTokens, outputTokens);
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    costUsd: cost?.usd ?? null,
+    costBasis: cost?.basis ?? null,
+    estimated: true,
+  };
+}
+
+function estimateTokenCount(text) {
+  return Math.max(1, Math.ceil(String(text || "").length / 4));
+}
+
+function sumUsage(usages) {
+  return usages.reduce(
+    (total, usage) => ({
+      inputTokens: total.inputTokens + usage.inputTokens,
+      outputTokens: total.outputTokens + usage.outputTokens,
+      totalTokens: total.totalTokens + usage.totalTokens,
+      costUsd: sumOptionalNumbers(total.costUsd, usage.costUsd),
+      costBasis: total.costBasis || usage.costBasis || null,
+      estimated: total.estimated || usage.estimated,
+    }),
+    { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: null, costBasis: null, estimated: false },
+  );
+}
+
+function estimateCost(inputTokens, outputTokens) {
+  const pricing = getModelPricing(MODEL);
+  if (!pricing) {
+    return null;
+  }
+
+  return {
+    usd: (inputTokens / 1000000) * pricing.input + (outputTokens / 1000000) * pricing.output,
+    basis: {
+      model: pricing.basisModel,
+      inputUsdPerMillion: pricing.input,
+      outputUsdPerMillion: pricing.output,
+      source: PRICING_SNAPSHOT.source?.url || "",
+      retrievedAt: PRICING_SNAPSHOT.source?.retrievedAt || "",
+    },
+  };
+}
+
+function getModelPricing(model) {
+  const modelKey = String(model || "").trim();
+  const pricingKey = PRICING_SNAPSHOT.aliases?.[modelKey] || modelKey;
+  return PRICING_SNAPSHOT.models?.[pricingKey] || null;
+}
+
+function sumOptionalNumbers(left, right) {
+  const safeLeft = Number.isFinite(left) ? left : 0;
+  const safeRight = Number.isFinite(right) ? right : 0;
+
+  return safeLeft || safeRight ? safeLeft + safeRight : null;
 }
 
 function normalizeTranslations(result, requestedParagraphs) {

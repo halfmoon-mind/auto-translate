@@ -33,6 +33,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         translations: result.translations,
         runs: result.runs,
+        usage: result.usage,
       });
       return;
     }

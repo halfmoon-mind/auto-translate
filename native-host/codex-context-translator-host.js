@@ -61,6 +61,7 @@ async function handleMessage(message) {
       ok: true,
       translations: result.translations,
       runs: result.runs,
+      usage: result.usage,
       source: "native",
     };
   }
