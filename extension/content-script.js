@@ -30,6 +30,17 @@
     "[role='banner']",
     "[role='contentinfo']",
   ].join(",");
+  const MAIN_CONTENT_SELECTOR = [
+    "main",
+    "article",
+    "[role='main']",
+  ].join(",");
+  const SECONDARY_CONTENT_SELECTOR = [
+    "aside",
+    "nav",
+    "[role='complementary']",
+    "[role='navigation']",
+  ].join(",");
   const INTERACTIVE_SELECTOR = [
     "a",
     "button",
@@ -372,13 +383,21 @@
 
   function prioritizeItems(items) {
     return items
-      .map((item, index) => ({ item, index, rank: getViewportRank(item.element) }))
+      .map((item, index) => ({
+        item,
+        index,
+        viewportRank: getViewportRank(item.element),
+        contentRank: getContentAreaRank(item.element),
+      }))
       .sort((left, right) => {
-        if (left.rank.group !== right.rank.group) {
-          return left.rank.group - right.rank.group;
+        if (left.viewportRank.group !== right.viewportRank.group) {
+          return left.viewportRank.group - right.viewportRank.group;
         }
-        if (left.rank.distance !== right.rank.distance) {
-          return left.rank.distance - right.rank.distance;
+        if (left.contentRank !== right.contentRank) {
+          return left.contentRank - right.contentRank;
+        }
+        if (left.viewportRank.distance !== right.viewportRank.distance) {
+          return left.viewportRank.distance - right.viewportRank.distance;
         }
         return left.index - right.index;
       })
@@ -398,6 +417,18 @@
     }
 
     return { group: 2, distance: Math.abs(rect.bottom) };
+  }
+
+  function getContentAreaRank(element) {
+    if (element.closest(SECONDARY_CONTENT_SELECTOR)) {
+      return 2;
+    }
+
+    if (element.closest(MAIN_CONTENT_SELECTOR)) {
+      return 0;
+    }
+
+    return 1;
   }
 
   function createTranslationBatches(items) {
