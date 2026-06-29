@@ -22,7 +22,12 @@
     "dd",
     "article div",
     "main div",
+    "[role='main'] div",
     "section div",
+    "article span[dir]",
+    "main span[dir]",
+    "[role='main'] span[dir]",
+    "section span[dir]",
   ].join(",");
   const STRUCTURAL_UI_SELECTOR = [
     "body > header",
@@ -249,7 +254,11 @@
     const seen = new Set();
 
     for (const element of nodes) {
-      if (!(element instanceof HTMLElement) || seen.has(element)) {
+      if (
+        !(element instanceof HTMLElement) ||
+        seen.has(element) ||
+        hasSelectedAncestor(element, seen)
+      ) {
         continue;
       }
 
@@ -277,6 +286,20 @@
     }
 
     return items;
+  }
+
+  function hasSelectedAncestor(element, selectedElements) {
+    let parent = element.parentElement;
+
+    while (parent) {
+      if (selectedElements.has(parent)) {
+        return true;
+      }
+
+      parent = parent.parentElement;
+    }
+
+    return false;
   }
 
   function collectCandidateNodes() {

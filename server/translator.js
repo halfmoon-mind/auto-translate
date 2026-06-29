@@ -165,6 +165,7 @@ function buildPrompt(request) {
     "Translate idioms and marketing phrases by intended meaning rather than word-for-word.",
     "Use each target's kind only as a style hint: headings should be concise, list items should stay list-like, captions should be compact, and paragraphs should read naturally.",
     "Keep terminology consistent across the batch and context. Avoid mixing Korean alternatives for the same source term.",
+    "Do not leave ordinary English words or phrases untranslated; preserve only names, product names, code/API terms, URLs, and explicit marker tokens.",
     "Preserve ids exactly. Preserve URLs, code identifiers, file paths, slash commands, model/API names, and product names unless a Korean equivalent is standard.",
     "Preserve every numeric token exactly as written, including commas, decimals, currency symbols, and percent signs; do not spell out or localize numbers.",
     "If a target contains inline link markers like [[CTX-LINK-1]]...[[/CTX-LINK-1]], keep those marker tokens exactly and translate the linked label between them.",
