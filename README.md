@@ -35,7 +35,7 @@ Install the native bridge once:
 3. Confirm the completion dialog.
 4. Use the opened setup page to run `다시 확인`.
 
-Chrome launches the native host only while it is handling a health check or translation request. There is no long-running background server process to keep alive.
+Chrome launches the native host only while it is handling a health check or translation session. During a page translation, the extension keeps one native messaging port open so translation batches can reuse the same host process. There is no long-running background server process to keep alive.
 
 If the bridge is missing or cannot start, the extension popup shows `설정 열기`. That opens an in-extension setup page, so users do not need to hunt through this README to understand the next step.
 

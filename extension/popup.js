@@ -7,11 +7,11 @@ const setupActions = document.getElementById("setupActions");
 const setupButton = document.getElementById("setupButton");
 const retryBridgeButton = document.getElementById("retryBridgeButton");
 
-const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs.v2";
-const FALLBACK_WAVE_MS_MIN = 20000;
-const FALLBACK_WAVE_MS_MAX = 60000;
-const OBSERVED_WAVE_MS_MIN = 10000;
-const OBSERVED_WAVE_MS_MAX = 120000;
+const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs.v3";
+const FALLBACK_WAVE_MS_MIN = 8000;
+const FALLBACK_WAVE_MS_MAX = 30000;
+const OBSERVED_WAVE_MS_MIN = 5000;
+const OBSERVED_WAVE_MS_MAX = 60000;
 
 let hasRenderedStatus = false;
 let activeTabId = null;
@@ -273,7 +273,7 @@ function renderElapsedText() {
     parts.push(work);
   }
 
-  const usage = formatUsage(status.usage);
+  const usage = formatUsage(status.usage || status.metrics?.estimatedUsage);
   if (usage) {
     parts.push(usage);
   }
@@ -288,12 +288,12 @@ function formatEstimate(metrics) {
 
   const averageWaveMs = readAverageWaveMs();
   if (averageWaveMs) {
-    return `예상 약 ${formatDuration(metrics.waveCount * averageWaveMs)}`;
+    return `예상 총 약 ${formatDuration(metrics.waveCount * averageWaveMs)}`;
   }
 
   const minMs = metrics.waveCount * FALLBACK_WAVE_MS_MIN;
   const maxMs = metrics.waveCount * FALLBACK_WAVE_MS_MAX;
-  return `예상 약 ${formatDuration(minMs)}~${formatDuration(maxMs)}`;
+  return `예상 총 약 ${formatDuration(minMs)}~${formatDuration(maxMs)}`;
 }
 
 function formatWork(metrics) {
@@ -317,11 +317,16 @@ function formatUsage(usage) {
     return "";
   }
 
-  const label = normalizedUsage.estimated ? "추정" : "사용";
+  const label = normalizedUsage.projected
+    ? "예상"
+    : normalizedUsage.estimated
+      ? "누적 추정"
+      : "사용";
+  const tokens = formatUsageTokens(normalizedUsage);
   const cost = formatCost(normalizedUsage.costUsd);
   return cost
-    ? `${label} ${formatTokenCount(normalizedUsage.totalTokens)}토큰 / API 환산 약 ${cost}`
-    : `${label} ${formatTokenCount(normalizedUsage.totalTokens)}토큰`;
+    ? `${label} ${tokens} / API 환산 약 ${cost}`
+    : `${label} ${tokens}`;
 }
 
 function normalizeUsage(usage) {
@@ -338,10 +343,23 @@ function normalizeUsage(usage) {
   }
 
   return {
+    inputTokens,
+    outputTokens,
     totalTokens,
     costUsd: readOptionalNumber(usage.costUsd),
     estimated: usage.estimated !== false,
+    projected: usage.projected === true,
   };
+}
+
+function formatUsageTokens(usage) {
+  const total = `${formatTokenCount(usage.totalTokens)}토큰`;
+
+  if (!usage.inputTokens && !usage.outputTokens) {
+    return total;
+  }
+
+  return `입력 ${formatTokenCount(usage.inputTokens)} / 출력 ${formatTokenCount(usage.outputTokens)} / 합계 ${total}`;
 }
 
 function readTokenCount(value) {
@@ -355,6 +373,10 @@ function readOptionalNumber(value) {
 function formatCost(value) {
   if (!Number.isFinite(value)) {
     return "";
+  }
+
+  if (value > 0 && value < 0.0001) {
+    return "<$0.0001";
   }
 
   if (value < 0.01) {

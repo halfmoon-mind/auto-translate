@@ -3,48 +3,59 @@
 const { getBridgeInfo, translatePayload } = require("../server/translator");
 
 let buffer = Buffer.alloc(0);
-let handled = false;
+let activeMessages = 0;
+let pendingWrites = 0;
+let stdinEnded = false;
 
 process.stdin.on("data", (chunk) => {
-  if (handled) {
-    return;
-  }
-
   buffer = Buffer.concat([buffer, chunk]);
-  readMessage();
+  readMessages();
+});
+
+process.stdin.on("end", () => {
+  stdinEnded = true;
+  exitWhenIdle();
 });
 
 process.stdin.on("error", (error) => {
   writeError(error);
+  stdinEnded = true;
+  exitWhenIdle();
 });
 
-function readMessage() {
-  if (buffer.length < 4) {
-    return;
+function readMessages() {
+  while (buffer.length >= 4) {
+    const messageLength = buffer.readUInt32LE(0);
+    const frameLength = 4 + messageLength;
+
+    if (buffer.length < frameLength) {
+      return;
+    }
+
+    const rawMessage = buffer.subarray(4, frameLength).toString("utf8");
+    buffer = buffer.subarray(frameLength);
+    let message;
+
+    try {
+      message = JSON.parse(rawMessage);
+    } catch {
+      writeError(new Error("Native host message must be valid JSON."));
+      continue;
+    }
+
+    activeMessages += 1;
+    handleMessage(message)
+      .then((response) => {
+        writeMessage(withRequestId(response, message));
+      })
+      .catch((error) => {
+        writeError(error, message);
+      })
+      .finally(() => {
+        activeMessages -= 1;
+        exitWhenIdle();
+      });
   }
-
-  const messageLength = buffer.readUInt32LE(0);
-  const frameLength = 4 + messageLength;
-
-  if (buffer.length < frameLength) {
-    return;
-  }
-
-  handled = true;
-
-  const rawMessage = buffer.subarray(4, frameLength).toString("utf8");
-  let message;
-
-  try {
-    message = JSON.parse(rawMessage);
-  } catch {
-    writeError(new Error("Native host message must be valid JSON."));
-    return;
-  }
-
-  handleMessage(message)
-    .then(writeMessage)
-    .catch(writeError);
 }
 
 async function handleMessage(message) {
@@ -72,11 +83,11 @@ async function handleMessage(message) {
   };
 }
 
-function writeError(error) {
-  writeMessage({
+function writeError(error, requestMessage) {
+  writeMessage(withRequestId({
     ok: false,
     error: getErrorMessage(error),
-  });
+  }, requestMessage));
 }
 
 function writeMessage(message) {
@@ -84,9 +95,28 @@ function writeMessage(message) {
   const payload = Buffer.from(json, "utf8");
   const header = Buffer.alloc(4);
   header.writeUInt32LE(payload.length, 0);
+  pendingWrites += 1;
   process.stdout.write(Buffer.concat([header, payload]), () => {
-    process.exit(0);
+    pendingWrites -= 1;
+    exitWhenIdle();
   });
+}
+
+function withRequestId(response, requestMessage) {
+  if (!requestMessage || requestMessage.requestId == null) {
+    return response;
+  }
+
+  return {
+    ...response,
+    requestId: requestMessage.requestId,
+  };
+}
+
+function exitWhenIdle() {
+  if (stdinEnded && activeMessages === 0 && pendingWrites === 0) {
+    process.exit(0);
+  }
 }
 
 function getErrorMessage(error) {

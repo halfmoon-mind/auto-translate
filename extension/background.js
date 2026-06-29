@@ -1,4 +1,8 @@
 const NATIVE_HOST = "com.codex_context_translator.host";
+const NATIVE_SESSION_IDLE_TIMEOUT_MS = 30000;
+
+const nativeSessions = new Map();
+let nextNativeRequestId = 1;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "CODEX_LOCAL_HEALTH") {
@@ -8,8 +12,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "CODEX_LOCAL_TRANSLATION_SESSION_START") {
+    handleTranslationSessionStart().then(sendResponse).catch((error) => {
+      sendResponse(toErrorResponse(error));
+    });
+    return true;
+  }
+
+  if (message?.type === "CODEX_LOCAL_TRANSLATION_SESSION_END") {
+    handleTranslationSessionEnd(message.sessionId).then(sendResponse).catch((error) => {
+      sendResponse(toErrorResponse(error));
+    });
+    return true;
+  }
+
   if (message?.type === "CODEX_LOCAL_TRANSLATE") {
-    handleTranslate(message.payload).then(sendResponse).catch((error) => {
+    handleTranslate(message.payload, message.sessionId).then(sendResponse).catch((error) => {
       sendResponse(toErrorResponse(error));
     });
     return true;
@@ -37,7 +55,64 @@ async function handleHealth() {
   };
 }
 
-async function handleTranslate(payload) {
+async function handleTranslationSessionStart() {
+  const session = openNativeSession();
+
+  try {
+    const data = await sendNativeSessionMessage(session, { type: "health" });
+
+    if (!data?.ok) {
+      throw createSetupError(
+        data?.error || "로컬 브리지 연결 실패",
+        data?.setupCode || "native_host_unreachable",
+      );
+    }
+
+    return {
+      ...data,
+      ok: true,
+      sessionId: session.id,
+      source: "native",
+    };
+  } catch (error) {
+    closeNativeSession(session, getErrorMessage(error));
+    throw error;
+  }
+}
+
+async function handleTranslationSessionEnd(sessionId) {
+  const session = getNativeSession(sessionId);
+
+  if (session) {
+    closeNativeSession(session);
+  }
+
+  return { ok: true };
+}
+
+async function handleTranslate(payload, sessionId) {
+  if (sessionId) {
+    const session = getNativeSession(sessionId);
+
+    if (!session) {
+      throw createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_host_unreachable");
+    }
+
+    const data = await sendNativeSessionMessage(session, { type: "translate", payload });
+
+    if (!data?.ok) {
+      throw createSetupError(
+        data?.error || "Native host translation failed.",
+        data?.setupCode || "native_host_unreachable",
+      );
+    }
+
+    return {
+      ...data,
+      source: "native",
+    };
+  }
+
   const data = await sendNativeHostMessage({ type: "translate", payload });
 
   if (!data?.ok) {
@@ -51,6 +126,133 @@ async function handleTranslate(payload) {
     ...data,
     source: "native",
   };
+}
+
+function openNativeSession() {
+  const session = {
+    id: createSessionId(),
+    port: chrome.runtime.connectNative(NATIVE_HOST),
+    pending: new Map(),
+    idleTimer: null,
+    closed: false,
+  };
+
+  session.port.onMessage.addListener((message) => {
+    handleNativeSessionMessage(session, message);
+  });
+  session.port.onDisconnect.addListener(() => {
+    handleNativeSessionDisconnect(session);
+  });
+
+  nativeSessions.set(session.id, session);
+  return session;
+}
+
+function getNativeSession(sessionId) {
+  if (typeof sessionId !== "string" || !sessionId) {
+    return null;
+  }
+
+  return nativeSessions.get(sessionId) || null;
+}
+
+function closeNativeSession(session, reason) {
+  if (session.closed) {
+    return;
+  }
+
+  session.closed = true;
+  nativeSessions.delete(session.id);
+  clearNativeSessionIdleTimer(session);
+
+  const error = reason
+    ? createNativeHostError(reason)
+    : createSetupError("번역 세션이 종료되었습니다.", "native_host_unreachable");
+
+  for (const pending of session.pending.values()) {
+    pending.reject(error);
+  }
+  session.pending.clear();
+
+  try {
+    session.port.disconnect();
+  } catch {
+    // The port may already be disconnected.
+  }
+}
+
+function sendNativeSessionMessage(session, message) {
+  return new Promise((resolve, reject) => {
+    if (session.closed) {
+      reject(createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_host_unreachable"));
+      return;
+    }
+
+    const requestId = String(nextNativeRequestId);
+    nextNativeRequestId += 1;
+
+    session.pending.set(requestId, { resolve, reject });
+    clearNativeSessionIdleTimer(session);
+
+    try {
+      session.port.postMessage({
+        ...message,
+        requestId,
+      });
+    } catch (error) {
+      session.pending.delete(requestId);
+      reject(createNativeHostError(getErrorMessage(error)));
+    }
+  });
+}
+
+function handleNativeSessionMessage(session, message) {
+  const requestId = typeof message?.requestId === "string" ? message.requestId : "";
+  const pending = session.pending.get(requestId);
+
+  if (!pending) {
+    return;
+  }
+
+  session.pending.delete(requestId);
+  pending.resolve(message);
+  scheduleNativeSessionIdleClose(session);
+}
+
+function handleNativeSessionDisconnect(session) {
+  if (session.closed) {
+    return;
+  }
+
+  const message = chrome.runtime.lastError?.message || "Native host session disconnected.";
+  closeNativeSession(session, message);
+}
+
+function createSessionId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function scheduleNativeSessionIdleClose(session) {
+  clearNativeSessionIdleTimer(session);
+
+  if (session.closed || session.pending.size > 0) {
+    return;
+  }
+
+  session.idleTimer = setTimeout(() => {
+    if (!session.closed && session.pending.size === 0) {
+      closeNativeSession(session);
+    }
+  }, NATIVE_SESSION_IDLE_TIMEOUT_MS);
+}
+
+function clearNativeSessionIdleTimer(session) {
+  if (!session.idleTimer) {
+    return;
+  }
+
+  clearTimeout(session.idleTimer);
+  session.idleTimer = null;
 }
 
 function sendNativeHostMessage(message) {

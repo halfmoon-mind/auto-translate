@@ -214,6 +214,7 @@
 
     const startedAt = Date.now();
     let metrics = null;
+    let sessionId = null;
 
     state.inProgress = true;
     ensureStyle();
@@ -235,6 +236,13 @@
         startedAt,
         metrics,
       });
+      const session = await startTranslationSession();
+      sessionId = session.sessionId;
+      metrics = addProjectedUsage(metrics, context, session.pricing);
+      publishStatus("translating", `${items.length}개 단락을 자동 번역 중입니다.`, 0, items.length, {
+        startedAt,
+        metrics,
+      });
 
       const result = await translateBatches({
         batches,
@@ -243,6 +251,7 @@
         startedAt,
         metrics,
         totalItems: items.length,
+        sessionId,
       });
 
       const elapsedMs = Date.now() - startedAt;
@@ -272,6 +281,13 @@
       });
       throw error;
     } finally {
+      if (sessionId) {
+        try {
+          await endTranslationSession(sessionId);
+        } catch (error) {
+          console.warn("Codex translation session cleanup failed.", error);
+        }
+      }
       state.inProgress = false;
       state.inflightTranslations.clear();
     }
@@ -732,7 +748,7 @@
     };
   }
 
-  async function translateBatches({ batches, page, context, startedAt, metrics, totalItems }) {
+  async function translateBatches({ batches, page, context, startedAt, metrics, totalItems, sessionId }) {
     const progress = { translated: 0, failed: 0, firstError: null, usage: null };
     const batchJobs = batches.map((batch, index) => ({ batch, index }));
     const priorityJobs = batchJobs.filter((job) => isPriorityBatch(job.batch));
@@ -750,6 +766,7 @@
         totalItems,
         progress,
         depth: 0,
+        sessionId,
       });
     });
 
@@ -765,6 +782,7 @@
         totalItems,
         progress,
         depth: 0,
+        sessionId,
       });
     });
 
@@ -835,7 +853,7 @@
     }
   }
 
-  async function requestTranslationBatch({ batch, page, context, index, totalBatches }) {
+  async function requestTranslationBatch({ batch, page, context, index, totalBatches, sessionId }) {
     const cachedById = new Map();
     const uncachedItems = [];
     const pendingItems = [];
@@ -880,6 +898,7 @@
           context,
           index,
           totalBatches,
+          sessionId,
         });
         usage = result.usage;
 
@@ -928,9 +947,10 @@
     return { translations, usage };
   }
 
-  async function fetchTranslations({ items, page, context, index, totalBatches }) {
+  async function fetchTranslations({ items, page, context, index, totalBatches, sessionId }) {
     const response = await sendRuntimeMessage({
       type: "CODEX_LOCAL_TRANSLATE",
+      sessionId,
       payload: {
         page,
         context,
@@ -956,6 +976,32 @@
     };
   }
 
+  async function startTranslationSession() {
+    const response = await sendRuntimeMessage({
+      type: "CODEX_LOCAL_TRANSLATION_SESSION_START",
+    });
+
+    if (!response?.ok || typeof response.sessionId !== "string") {
+      throw new Error(response?.error || "로컬 번역 세션을 시작하지 못했습니다.");
+    }
+
+    return {
+      sessionId: response.sessionId,
+      pricing: response.pricing || null,
+    };
+  }
+
+  async function endTranslationSession(sessionId) {
+    const response = await sendRuntimeMessage({
+      type: "CODEX_LOCAL_TRANSLATION_SESSION_END",
+      sessionId,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "로컬 번역 세션을 종료하지 못했습니다.");
+    }
+  }
+
   function addUsage(progress, usage) {
     const normalizedUsage = normalizeUsage(usage);
     if (!normalizedUsage) {
@@ -963,6 +1009,94 @@
     }
 
     progress.usage = sumUsage(progress.usage, normalizedUsage);
+  }
+
+  function addProjectedUsage(metrics, context, pricing) {
+    const projectedUsage = estimateProjectedUsage(metrics, context, pricing);
+
+    if (!projectedUsage) {
+      return metrics;
+    }
+
+    return {
+      ...metrics,
+      estimatedUsage: projectedUsage,
+    };
+  }
+
+  function estimateProjectedUsage(metrics, context, pricing) {
+    if (!metrics || !Number.isFinite(metrics.targetChars) || metrics.targetChars < 1) {
+      return null;
+    }
+
+    const batchCount = Number.isFinite(metrics.batchCount) && metrics.batchCount > 0
+      ? metrics.batchCount
+      : 1;
+    const targetCount = Number.isFinite(metrics.targetCount) && metrics.targetCount > 0
+      ? metrics.targetCount
+      : 1;
+    const contextChars = Array.isArray(context)
+      ? context.reduce((sum, value) => sum + String(value || "").length, 0)
+      : 0;
+    const promptOverheadChars = 1800 * batchCount;
+    const jsonOverheadChars = 120 * batchCount + 40 * targetCount;
+    const inputTokens = estimateTokenCountFromChars(
+      metrics.targetChars + contextChars * batchCount + promptOverheadChars + jsonOverheadChars,
+    );
+    const outputTokens = estimateTokenCountFromChars(metrics.targetChars + 40 * targetCount);
+    const totalTokens = inputTokens + outputTokens;
+    const cost = estimateProjectedCost(inputTokens, outputTokens, pricing);
+
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      costUsd: cost?.usd ?? null,
+      costBasis: cost?.basis ?? null,
+      estimated: true,
+      projected: true,
+    };
+  }
+
+  function estimateProjectedCost(inputTokens, outputTokens, pricing) {
+    const safePricing = normalizePricing(pricing);
+    if (!safePricing) {
+      return null;
+    }
+
+    return {
+      usd: (inputTokens / 1000000) * safePricing.inputUsdPerMillion +
+        (outputTokens / 1000000) * safePricing.outputUsdPerMillion,
+      basis: safePricing,
+    };
+  }
+
+  function normalizePricing(pricing) {
+    if (!pricing || typeof pricing !== "object") {
+      return null;
+    }
+
+    const inputUsdPerMillion = readOptionalNumber(pricing.inputUsdPerMillion);
+    const outputUsdPerMillion = readOptionalNumber(pricing.outputUsdPerMillion);
+
+    if (!Number.isFinite(inputUsdPerMillion) || !Number.isFinite(outputUsdPerMillion)) {
+      return null;
+    }
+
+    return {
+      model: typeof pricing.model === "string" ? pricing.model : "",
+      inputUsdPerMillion,
+      cachedInputUsdPerMillion: readOptionalNumber(pricing.cachedInputUsdPerMillion),
+      outputUsdPerMillion,
+      source: typeof pricing.source === "string" ? pricing.source : "",
+      retrievedAt: typeof pricing.retrievedAt === "string" ? pricing.retrievedAt : "",
+      unit: typeof pricing.unit === "string" ? pricing.unit : "",
+      tier: typeof pricing.tier === "string" ? pricing.tier : "",
+    };
+  }
+
+  function estimateTokenCountFromChars(charCount) {
+    return Math.max(1, Math.ceil(Math.max(0, charCount) / 4));
   }
 
   function sumUsage(current, next) {
@@ -1000,6 +1134,7 @@
       costUsd: readOptionalNumber(usage.costUsd),
       costBasis: usage.costBasis && typeof usage.costBasis === "object" ? usage.costBasis : null,
       estimated: usage.estimated !== false,
+      projected: usage.projected === true,
     };
   }
 

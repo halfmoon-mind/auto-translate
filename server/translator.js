@@ -61,6 +61,7 @@ function getBridgeInfo() {
     node: process.version,
     maxParagraphsPerRun: MAX_PARAGRAPHS_PER_RUN,
     maxParallelRuns: MAX_PARALLEL_RUNS,
+    pricing: getUsagePricingInfo(),
   };
 
   if (!nodeStatus.ok) {
@@ -634,9 +635,12 @@ function estimateCost(inputTokens, outputTokens) {
     basis: {
       model: pricing.basisModel,
       inputUsdPerMillion: pricing.input,
+      cachedInputUsdPerMillion: pricing.cachedInput,
       outputUsdPerMillion: pricing.output,
       source: PRICING_SNAPSHOT.source?.url || "",
       retrievedAt: PRICING_SNAPSHOT.source?.retrievedAt || "",
+      unit: PRICING_SNAPSHOT.unit || "",
+      tier: PRICING_SNAPSHOT.tier || "",
     },
   };
 }
@@ -645,6 +649,24 @@ function getModelPricing(model) {
   const modelKey = String(model || "").trim();
   const pricingKey = PRICING_SNAPSHOT.aliases?.[modelKey] || modelKey;
   return PRICING_SNAPSHOT.models?.[pricingKey] || null;
+}
+
+function getUsagePricingInfo() {
+  const pricing = getModelPricing(MODEL);
+  if (!pricing) {
+    return null;
+  }
+
+  return {
+    model: pricing.basisModel,
+    inputUsdPerMillion: pricing.input,
+    cachedInputUsdPerMillion: pricing.cachedInput,
+    outputUsdPerMillion: pricing.output,
+    source: PRICING_SNAPSHOT.source?.url || "",
+    retrievedAt: PRICING_SNAPSHOT.source?.retrievedAt || "",
+    unit: PRICING_SNAPSHOT.unit || "",
+    tier: PRICING_SNAPSHOT.tier || "",
+  };
 }
 
 function sumOptionalNumbers(left, right) {
