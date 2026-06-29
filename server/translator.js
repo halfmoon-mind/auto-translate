@@ -263,9 +263,7 @@ function runCodex(prompt) {
       args.splice(1, 0, "--model", MODEL);
     }
 
-    const childEnv = { ...process.env };
-    delete childEnv.OPENAI_API_KEY;
-    delete childEnv.CODEX_API_KEY;
+    const childEnv = buildCodexChildEnv();
 
     const child = spawn(CODEX_BIN, args, {
       cwd: path.join(__dirname, ".."),
@@ -324,6 +322,33 @@ function runCodex(prompt) {
 
     child.stdin.end(prompt);
   });
+}
+
+function buildCodexChildEnv() {
+  const childEnv = { ...process.env };
+  childEnv.PATH = prependPathEntries(childEnv.PATH, [
+    path.dirname(process.execPath),
+    path.isAbsolute(CODEX_BIN) ? path.dirname(CODEX_BIN) : "",
+  ]);
+  delete childEnv.OPENAI_API_KEY;
+  delete childEnv.CODEX_API_KEY;
+  return childEnv;
+}
+
+function prependPathEntries(currentPath, entries) {
+  const seen = new Set();
+  const pathEntries = [];
+
+  for (const entry of [...entries, ...(currentPath || "").split(":")]) {
+    if (!entry || seen.has(entry)) {
+      continue;
+    }
+
+    seen.add(entry);
+    pathEntries.push(entry);
+  }
+
+  return pathEntries.join(":");
 }
 
 function normalizeEffort(value) {

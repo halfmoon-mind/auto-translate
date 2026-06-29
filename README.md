@@ -1,24 +1,21 @@
 # Codex Context Translator
 
-Personal Chrome extension that translates visible web-page paragraphs into Korean through a local Codex bridge. It does not use an OpenAI API key.
+Personal Chrome extension that translates visible web-page paragraphs into Korean through a local Codex native bridge. It does not use an OpenAI API key.
 
 ## Assumptions
 
 - This is for local personal use, not public distribution.
 - Codex CLI is installed and logged in with ChatGPT: `codex login`.
 - Translation uses the Spark fast profile, automatic page splitting, and limited parallelism for better speed.
-- You run one local server while translating.
+- Chrome launches the native host on demand while translating.
 
 ## Run
 
-Start the local bridge:
+Install the native bridge once:
 
-```sh
-cd /Users/sanghyeon/projects/auto-translate/server
-npm start
-```
-
-Leave that terminal open while using the extension. Stop it with `Ctrl+C`.
+1. Open `/Users/sanghyeon/projects/auto-translate/companion/macos`.
+2. Double-click `Codex Translator Installer.app`.
+3. Confirm the completion dialog.
 
 Load the extension:
 
@@ -29,16 +26,16 @@ Load the extension:
 
 Open a normal web page, click the extension, then choose `페이지 번역`.
 
+Chrome starts the native host only while it is handling a health check or translation request. There is no long-running `npm start` process to restart after host code changes.
+
 ## Configuration
 
-The server defaults prioritize speed:
+The native bridge defaults prioritize speed:
 
 ```sh
-CODEX_TRANSLATOR_PORT=17387
 CODEX_TRANSLATOR_MODEL=gpt-5.3-codex-spark
 CODEX_TRANSLATOR_EFFORT=medium
 CODEX_TRANSLATOR_TIMEOUT_MS=180000
-CODEX_TRANSLATOR_MAX_BODY_BYTES=8388608
 CODEX_TRANSLATOR_MAX_CONTEXT_CHARS=6000
 CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN=40
 CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN=12000
@@ -51,7 +48,7 @@ Set `CODEX_TRANSLATOR_MODEL=gpt-5.4-mini` if you want the previous, steadier mod
 
 ## API-Key Avoidance
 
-The bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child process environment and passes `forced_login_method="chatgpt"` to `codex exec`. It also disables the shell tool for translation runs. If your Codex CLI is not logged in with ChatGPT, translation will fail instead of falling back to API-key billing.
+The native bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child process environment and passes `forced_login_method="chatgpt"` to `codex exec`. It also disables the shell tool for translation runs. If your Codex CLI is not logged in with ChatGPT, translation will fail instead of falling back to API-key billing.
 
 ## Notes
 

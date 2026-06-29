@@ -1,0 +1,12 @@
+#!/bin/sh
+
+APP_DIR="$(cd "$(dirname "$0")/../../../../.." && pwd)"
+INSTALL_SCRIPT="$APP_DIR/scripts/install-native-host-macos.sh"
+
+if OUTPUT="$("$INSTALL_SCRIPT" 2>&1)"; then
+  /usr/bin/osascript -e 'display dialog "Native host 설치가 완료되었습니다. Chrome 확장 프로그램을 새로고침한 뒤 사용하세요." buttons {"확인"} default button "확인" with title "Codex Translator"'
+else
+  ESCAPED_OUTPUT="$(printf "%s" "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  /usr/bin/osascript -e 'display dialog "Native host 설치에 실패했습니다.\n\n'"$ESCAPED_OUTPUT"'" buttons {"확인"} default button "확인" with title "Codex Translator" with icon caution'
+  exit 1
+fi

@@ -41,12 +41,12 @@ async function checkServerHealth() {
     const response = await sendRuntimeMessage({ type: "CODEX_LOCAL_HEALTH" });
 
     if (!response?.ok) {
-      throw new Error(response?.error || "로컬 서버 연결 실패");
+      throw new Error(response?.error || "로컬 브리지 연결 실패");
     }
 
-    serverStatus.textContent = `로컬 서버 / ${response.model} / ${response.effort}`;
+    serverStatus.textContent = `로컬 브리지 / ${response.model} / ${response.effort}`;
   } catch (error) {
-    serverStatus.textContent = "로컬 서버 꺼짐";
+    serverStatus.textContent = "로컬 브리지 연결 실패";
     statusText.textContent = getErrorMessage(error);
   }
 }

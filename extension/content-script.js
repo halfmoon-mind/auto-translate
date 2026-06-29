@@ -115,10 +115,13 @@
   const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 12000;
   const ESTIMATE_MAX_PARALLEL_RUNS = 3;
   const MAX_RETRY_SPLIT_DEPTH = 6;
+  const MAX_TRANSLATION_CACHE_ENTRIES = 500;
+  const QUALITY_ERROR_PREFIX = "번역 품질 검증 실패";
 
   const state = {
     inProgress: false,
     originals: new Map(),
+    translationCache: new Map(),
   };
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -521,6 +524,59 @@
   }
 
   async function requestTranslationBatch({ batch, page, context, index, totalBatches }) {
+    const cachedById = new Map();
+    const uncachedItems = [];
+
+    for (const item of batch) {
+      const cachedText = getCachedTranslation(page, item);
+
+      if (cachedText) {
+        cachedById.set(item.id, cachedText);
+        continue;
+      }
+
+      uncachedItems.push(item);
+    }
+
+    const uniqueItems = getUniqueTranslationItems(uncachedItems);
+    const fetchedByKey = new Map();
+
+    if (uniqueItems.length > 0) {
+      const translations = await fetchTranslations({
+        items: uniqueItems,
+        page,
+        context,
+        index,
+        totalBatches,
+      });
+
+      for (const item of uniqueItems) {
+        const translatedText = translations.get(item.id);
+        const sourceKey = getTranslationSourceKey(item);
+
+        fetchedByKey.set(sourceKey, translatedText);
+        cacheTranslation(page, item, translatedText);
+      }
+    }
+
+    const translations = [];
+
+    for (const item of batch) {
+      const translatedText =
+        cachedById.get(item.id) || fetchedByKey.get(getTranslationSourceKey(item));
+
+      if (!translatedText) {
+        throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
+      }
+
+      validateTranslationQuality(item, translatedText);
+      translations.push({ id: item.id, text: translatedText });
+    }
+
+    return translations;
+  }
+
+  async function fetchTranslations({ items, page, context, index, totalBatches }) {
     const response = await sendRuntimeMessage({
       type: "CODEX_LOCAL_TRANSLATE",
       payload: {
@@ -530,7 +586,7 @@
           index: index + 1,
           total: totalBatches,
         },
-        paragraphs: batch.map((item) => ({
+        paragraphs: items.map((item) => ({
           id: item.id,
           text: item.text,
         })),
@@ -538,10 +594,175 @@
     });
 
     if (!response?.ok) {
-      throw new Error(response?.error || "로컬 번역 서버 오류입니다.");
+      throw new Error(response?.error || "로컬 번역 브리지 오류입니다.");
     }
 
-    return response.translations || [];
+    return normalizeTranslationResponse(items, response.translations || []);
+  }
+
+  function normalizeTranslationResponse(items, translations) {
+    const byId = new Map();
+
+    for (const translation of translations) {
+      if (!translation || typeof translation !== "object") {
+        continue;
+      }
+
+      const id = typeof translation.id === "string" ? translation.id : "";
+      const text = typeof translation.text === "string" ? translation.text.trim() : "";
+
+      if (id && text) {
+        byId.set(id, text);
+      }
+    }
+
+    for (const item of items) {
+      const translatedText = byId.get(item.id);
+
+      if (!translatedText) {
+        throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
+      }
+
+      validateTranslationQuality(item, translatedText);
+    }
+
+    return byId;
+  }
+
+  function getUniqueTranslationItems(items) {
+    const uniqueItems = [];
+    const seen = new Set();
+
+    for (const item of items) {
+      const sourceKey = getTranslationSourceKey(item);
+
+      if (seen.has(sourceKey)) {
+        continue;
+      }
+
+      seen.add(sourceKey);
+      uniqueItems.push(item);
+    }
+
+    return uniqueItems;
+  }
+
+  function getCachedTranslation(page, item) {
+    const cacheKey = getTranslationCacheKey(page, item);
+    const cachedText = state.translationCache.get(cacheKey);
+
+    if (!cachedText) {
+      return "";
+    }
+
+    try {
+      validateTranslationQuality(item, cachedText);
+    } catch {
+      state.translationCache.delete(cacheKey);
+      return "";
+    }
+
+    state.translationCache.delete(cacheKey);
+    state.translationCache.set(cacheKey, cachedText);
+    return cachedText;
+  }
+
+  function cacheTranslation(page, item, translatedText) {
+    const cacheKey = getTranslationCacheKey(page, item);
+    state.translationCache.set(cacheKey, translatedText);
+
+    while (state.translationCache.size > MAX_TRANSLATION_CACHE_ENTRIES) {
+      const oldestKey = state.translationCache.keys().next().value;
+      state.translationCache.delete(oldestKey);
+    }
+  }
+
+  function getTranslationCacheKey(page, item) {
+    return `${getPageCacheScope(page)}\n${getTranslationSourceKey(item)}`;
+  }
+
+  function getPageCacheScope(page) {
+    const url = typeof page?.url === "string" ? page.url.split("#")[0] : "";
+    const title = typeof page?.title === "string" ? page.title : "";
+
+    return `${url}\n${title}`;
+  }
+
+  function getTranslationSourceKey(item) {
+    return item.text;
+  }
+
+  function validateTranslationQuality(item, translatedText) {
+    const text = String(translatedText || "").trim();
+
+    if (!text) {
+      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 결과가 비어 있습니다.`);
+    }
+
+    const missingLinkTokens = getMissingLinkTokens(item, text);
+    if (missingLinkTokens.length > 0) {
+      throw new Error(
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 링크 마커가 누락되었습니다 (${missingLinkTokens.join(", ")}).`,
+      );
+    }
+
+    const sourceText = stripLinkMarkers(item.text);
+    const targetText = stripLinkMarkers(text);
+    const missingUrls = getMissingPreservedTokens(extractUrls(sourceText), targetText);
+
+    if (missingUrls.length > 0) {
+      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} URL이 누락되었습니다.`);
+    }
+
+    const missingNumbers = getMissingNumbers(sourceText, targetText);
+
+    if (missingNumbers.length > 0) {
+      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 숫자가 누락되었습니다.`);
+    }
+  }
+
+  function getMissingLinkTokens(item, translatedText) {
+    const missing = [];
+
+    for (const link of item.links || []) {
+      if (
+        !translatedText.includes(`[[${link.token}]]`) ||
+        !translatedText.includes(`[[/${link.token}]]`)
+      ) {
+        missing.push(link.token);
+      }
+    }
+
+    return missing;
+  }
+
+  function extractUrls(text) {
+    return getUniqueMatches(text, /https?:\/\/[^\s<>"')\]]+/g).map((url) =>
+      url.replace(/[.,;:!?]+$/, ""),
+    );
+  }
+
+  function getMissingPreservedTokens(tokens, targetText) {
+    return tokens.filter((token) => !targetText.includes(token));
+  }
+
+  function getMissingNumbers(sourceText, targetText) {
+    const sourceNumbers = extractNumbers(sourceText);
+    const targetNumbers = new Set(extractNumbers(targetText).map(normalizeNumberToken));
+
+    return sourceNumbers.filter((number) => !targetNumbers.has(normalizeNumberToken(number)));
+  }
+
+  function extractNumbers(text) {
+    return getUniqueMatches(text, /[$€£¥₩]?\d[\d,]*(?:\.\d+)?%?/g);
+  }
+
+  function normalizeNumberToken(token) {
+    return token.replace(/[$€£¥₩,]/g, "");
+  }
+
+  function getUniqueMatches(text, pattern) {
+    return Array.from(new Set(String(text || "").match(pattern) || []));
   }
 
   function shouldSplitRetry(error) {
@@ -549,6 +770,8 @@
     return (
       !message.includes("failed to fetch") &&
       !message.includes("local server responded") &&
+      !message.includes("native messaging host") &&
+      !message.includes("native host") &&
       !message.includes("not logged in") &&
       !message.includes("log in") &&
       !message.includes("unauthorized") &&
