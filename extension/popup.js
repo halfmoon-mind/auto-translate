@@ -4,9 +4,11 @@ const statusText = document.getElementById("statusText");
 const serverStatus = document.getElementById("serverStatus");
 const elapsedText = document.getElementById("elapsedText");
 
-const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs";
-const FALLBACK_WAVE_MS_MIN = 30000;
-const FALLBACK_WAVE_MS_MAX = 75000;
+const AVG_WAVE_MS_STORAGE_KEY = "codexTranslatorAvgWaveMs.v2";
+const FALLBACK_WAVE_MS_MIN = 20000;
+const FALLBACK_WAVE_MS_MAX = 60000;
+const OBSERVED_WAVE_MS_MIN = 10000;
+const OBSERVED_WAVE_MS_MAX = 120000;
 
 let hasRenderedStatus = false;
 let activeTabId = null;
@@ -288,7 +290,13 @@ function formatWork(metrics) {
   }
 
   const parallelRuns = Number.isFinite(metrics.parallelRuns) ? metrics.parallelRuns : 1;
-  return `배치 ${metrics.batchCount}개 / 동시 ${parallelRuns}개`;
+  const priorityBatchCount = Number.isFinite(metrics.priorityBatchCount)
+    ? metrics.priorityBatchCount
+    : 0;
+
+  return priorityBatchCount > 0
+    ? `배치 ${metrics.batchCount}개 / 우선 ${priorityBatchCount}개 / 동시 ${parallelRuns}개`
+    : `배치 ${metrics.batchCount}개 / 동시 ${parallelRuns}개`;
 }
 
 function formatUsage(usage) {
@@ -372,7 +380,11 @@ function recordElapsedSample(metrics, elapsedMs) {
     return;
   }
 
-  const observedWaveMs = clamp(elapsedMs / metrics.waveCount, 30000, 180000);
+  const observedWaveMs = clamp(
+    elapsedMs / metrics.waveCount,
+    OBSERVED_WAVE_MS_MIN,
+    OBSERVED_WAVE_MS_MAX,
+  );
   const previousWaveMs = readAverageWaveMs();
   const nextWaveMs = previousWaveMs
     ? previousWaveMs * 0.7 + observedWaveMs * 0.3

@@ -127,13 +127,13 @@
   const INLINE_MARKER_PATTERN = /\[\[(CTX-LINK-\d+)\]\]([\s\S]*?)\[\[\/\1\]\]|\[\[(CTX-PRESERVE-\d+)\]\]/g;
   const ANY_LINK_MARKER_PATTERN = /\[\[\/?CTX-LINK-\d+\]\]/g;
   const ANY_PRESERVE_MARKER_PATTERN = /\[\[CTX-PRESERVE-\d+\]\]/g;
-  const MAX_CONTEXT_ITEMS = 40;
-  const MAX_CONTEXT_SNIPPET_CHARS = 180;
-  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 20;
-  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 7000;
-  const ESTIMATE_MAX_PARALLEL_RUNS = 4;
-  const PRIORITY_BATCH_MAX_PARAGRAPHS = 8;
-  const PRIORITY_BATCH_MAX_TARGET_CHARS = 2500;
+  const MAX_CONTEXT_ITEMS = 12;
+  const MAX_CONTEXT_SNIPPET_CHARS = 120;
+  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 10;
+  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 3000;
+  const ESTIMATE_MAX_PARALLEL_RUNS = 8;
+  const PRIORITY_BATCH_MAX_PARAGRAPHS = 4;
+  const PRIORITY_BATCH_MAX_TARGET_CHARS = 1200;
   const MAX_RETRY_SPLIT_DEPTH = 6;
   const MAX_TRANSLATION_CACHE_ENTRIES = 500;
   const QUALITY_ERROR_PREFIX = "번역 품질 검증 실패";
@@ -143,6 +143,7 @@
     lastStatus: null,
     originals: new Map(),
     translationCache: new Map(),
+    inflightTranslations: new Map(),
   };
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -238,6 +239,7 @@
       throw error;
     } finally {
       state.inProgress = false;
+      state.inflightTranslations.clear();
     }
   }
 
@@ -407,9 +409,13 @@
   }
 
   function hasBlockingDescendant(element) {
-    return Array.from(element.querySelectorAll(BLOCKING_DESCENDANT_SELECTOR)).some(
-      (descendant) => !descendant.closest(INLINE_PRESERVE_SELECTOR),
-    );
+    for (const descendant of element.querySelectorAll(BLOCKING_DESCENDANT_SELECTOR)) {
+      if (!descendant.closest(INLINE_PRESERVE_SELECTOR)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function isVisible(element) {
@@ -569,10 +575,14 @@
   function estimateTranslationWork(items, batches) {
     const targetChars = items.reduce((sum, item) => sum + item.text.length, 0);
     const batchCount = batches.length;
-    const parallelRuns = Math.min(ESTIMATE_MAX_PARALLEL_RUNS, Math.max(1, batchCount - 1));
-    const waveCount = batchCount > 1
-      ? 1 + Math.ceil((batchCount - 1) / parallelRuns)
-      : batchCount;
+    const parallelRuns = batchCount > 0
+      ? Math.min(ESTIMATE_MAX_PARALLEL_RUNS, batchCount)
+      : 0;
+    const priorityBatchCount = countPriorityBatches(batches);
+    const regularBatchCount = batchCount - priorityBatchCount;
+    const waveCount = parallelRuns > 0
+      ? Math.ceil(priorityBatchCount / parallelRuns) + Math.ceil(regularBatchCount / parallelRuns)
+      : 0;
 
     return {
       targetCount: items.length,
@@ -580,18 +590,22 @@
       batchCount,
       parallelRuns,
       waveCount,
+      priorityBatchCount,
     };
   }
 
   async function translateBatches({ batches, page, context, startedAt, metrics, totalItems }) {
     const progress = { translated: 0, failed: 0, firstError: null, usage: null };
+    const batchJobs = batches.map((batch, index) => ({ batch, index }));
+    const priorityJobs = batchJobs.filter((job) => isPriorityBatch(job.batch));
+    const regularJobs = batchJobs.filter((job) => !isPriorityBatch(job.batch));
 
-    if (batches.length > 0) {
+    await mapWithConcurrency(priorityJobs, ESTIMATE_MAX_PARALLEL_RUNS, async ({ batch, index }) => {
       await translateBatchWithRetry({
-        batch: batches[0],
+        batch,
         page,
         context,
-        index: 0,
+        index,
         totalBatches: batches.length,
         startedAt,
         metrics,
@@ -599,14 +613,14 @@
         progress,
         depth: 0,
       });
-    }
+    });
 
-    await mapWithConcurrency(batches.slice(1), ESTIMATE_MAX_PARALLEL_RUNS, async (batch, index) => {
+    await mapWithConcurrency(regularJobs, ESTIMATE_MAX_PARALLEL_RUNS, async ({ batch, index }) => {
       await translateBatchWithRetry({
         batch,
         page,
         context,
-        index: index + 1,
+        index,
         totalBatches: batches.length,
         startedAt,
         metrics,
@@ -625,6 +639,14 @@
     }
 
     return progress;
+  }
+
+  function countPriorityBatches(batches) {
+    return batches.reduce((count, batch) => count + (isPriorityBatch(batch) ? 1 : 0), 0);
+  }
+
+  function isPriorityBatch(batch) {
+    return batch.some((item) => getViewportRank(item.element).group === 0);
   }
 
   async function mapWithConcurrency(items, concurrency, mapper) {
@@ -654,16 +676,18 @@
     } catch (error) {
       if (batch.length > 1 && depth < MAX_RETRY_SPLIT_DEPTH && shouldSplitRetry(error)) {
         const midpoint = Math.ceil(batch.length / 2);
-        await translateBatchWithRetry({
-          ...options,
-          batch: batch.slice(0, midpoint),
-          depth: depth + 1,
-        });
-        await translateBatchWithRetry({
-          ...options,
-          batch: batch.slice(midpoint),
-          depth: depth + 1,
-        });
+        await Promise.all([
+          translateBatchWithRetry({
+            ...options,
+            batch: batch.slice(0, midpoint),
+            depth: depth + 1,
+          }),
+          translateBatchWithRetry({
+            ...options,
+            batch: batch.slice(midpoint),
+            depth: depth + 1,
+          }),
+        ]);
         return;
       }
 
@@ -676,6 +700,7 @@
   async function requestTranslationBatch({ batch, page, context, index, totalBatches }) {
     const cachedById = new Map();
     const uncachedItems = [];
+    const pendingItems = [];
 
     for (const item of batch) {
       const cachedText = getCachedTranslation(page, item);
@@ -685,43 +710,80 @@
         continue;
       }
 
+      const cacheKey = getTranslationCacheKey(page, item);
+      const pendingTranslation = state.inflightTranslations.get(cacheKey);
+
+      if (pendingTranslation) {
+        pendingItems.push({ item, promise: pendingTranslation });
+        continue;
+      }
+
       uncachedItems.push(item);
     }
 
     const uniqueItems = getUniqueTranslationItems(uncachedItems);
     const fetchedByKey = new Map();
+    const pendingByCacheKey = new Map();
     let usage = null;
 
     if (uniqueItems.length > 0) {
-      const result = await fetchTranslations({
-        items: uniqueItems,
-        page,
-        context,
-        index,
-        totalBatches,
-      });
-      usage = result.usage;
-
       for (const item of uniqueItems) {
-        const translatedText = result.translations.get(item.id);
-        const sourceKey = getTranslationSourceKey(item);
+        const cacheKey = getTranslationCacheKey(page, item);
+        const deferred = createDeferredTranslation();
 
-        fetchedByKey.set(sourceKey, translatedText);
-        cacheTranslation(page, item, translatedText);
+        pendingByCacheKey.set(cacheKey, deferred);
+        state.inflightTranslations.set(cacheKey, deferred.promise);
       }
+
+      try {
+        const result = await fetchTranslations({
+          items: uniqueItems,
+          page,
+          context,
+          index,
+          totalBatches,
+        });
+        usage = result.usage;
+
+        for (const item of uniqueItems) {
+          const translatedText = result.translations.get(item.id);
+          const sourceKey = getTranslationSourceKey(item);
+          const cacheKey = getTranslationCacheKey(page, item);
+
+          fetchedByKey.set(sourceKey, translatedText);
+          pendingByCacheKey.get(cacheKey)?.resolve(translatedText);
+        }
+      } catch (error) {
+        for (const deferred of pendingByCacheKey.values()) {
+          deferred.reject(error);
+        }
+        throw error;
+      } finally {
+        for (const cacheKey of pendingByCacheKey.keys()) {
+          state.inflightTranslations.delete(cacheKey);
+        }
+      }
+    }
+
+    for (const { item, promise } of pendingItems) {
+      fetchedByKey.set(getTranslationSourceKey(item), await promise);
     }
 
     const translations = [];
 
     for (const item of batch) {
+      const sourceKey = getTranslationSourceKey(item);
       const translatedText =
-        cachedById.get(item.id) || fetchedByKey.get(getTranslationSourceKey(item));
+        cachedById.get(item.id) || fetchedByKey.get(sourceKey);
 
       if (!translatedText) {
         throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
       }
 
       validateTranslationQuality(item, translatedText);
+      if (fetchedByKey.has(sourceKey)) {
+        cacheTranslation(page, item, translatedText);
+      }
       translations.push({ id: item.id, text: translatedText });
     }
 
@@ -865,6 +927,18 @@
     return uniqueItems;
   }
 
+  function createDeferredTranslation() {
+    let resolve;
+    let reject;
+    const promise = new Promise((promiseResolve, promiseReject) => {
+      resolve = promiseResolve;
+      reject = promiseReject;
+    });
+
+    promise.catch(() => {});
+    return { promise, resolve, reject };
+  }
+
   function getCachedTranslation(page, item) {
     const cacheKey = getTranslationCacheKey(page, item);
     const cachedText = state.translationCache.get(cacheKey);
@@ -942,7 +1016,9 @@
     const missingNumbers = getMissingNumbers(sourceText, targetText);
 
     if (missingNumbers.length > 0) {
-      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 숫자가 누락되었습니다.`);
+      throw new Error(
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 숫자가 누락되었습니다 (${missingNumbers.join(", ")}).`,
+      );
     }
   }
 
