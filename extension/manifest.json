@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Context Translator",
+  "version": "0.1.0",
+  "description": "Translate visible page paragraphs into Korean through a local Codex bridge.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:17387/*", "http://localhost:17387/*"],
+  "action": {
+    "default_title": "Codex 번역",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

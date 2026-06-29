@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex 번역</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Codex 번역</h1>
+        <p id="serverStatus" class="status muted">서버 확인 중</p>
+      </header>
+
+      <div class="actions">
+        <button id="translateButton" type="button">페이지 번역</button>
+        <button id="restoreButton" class="secondary" type="button">원문 복원</button>
+      </div>
+
+      <p id="statusText" class="status">대기 중</p>
+      <p id="elapsedText" class="status detail">경과 시간 대기</p>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
