@@ -151,6 +151,7 @@ function normalizeTranslateRequest(payload) {
     context: normalizeContext(payload.context),
     batch: normalizeBatch(payload.batch),
     paragraphs,
+    qualityRetry: normalizeQualityRetry(payload.qualityRetry),
   };
 }
 
@@ -218,6 +219,31 @@ function normalizeContext(context) {
   return snippets;
 }
 
+function normalizeQualityRetry(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const itemId = normalizeInlineString(value.itemId, 80);
+  const reason = normalizeInlineString(value.reason, 80);
+  const missingNumbers = Array.isArray(value.missingNumbers)
+    ? value.missingNumbers
+        .map((number) => normalizeInlineString(number, 40))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+
+  if (!itemId && !reason && missingNumbers.length === 0) {
+    return null;
+  }
+
+  return {
+    itemId,
+    reason,
+    missingNumbers,
+  };
+}
+
 function normalizeInlineString(value, maxLength) {
   if (typeof value !== "string") {
     return "";
@@ -250,11 +276,32 @@ function buildPrompt(request) {
     "If a target contains inline format markers like [[CTX-FMT-1]]...[[/CTX-FMT-1]], keep those marker tokens exactly and translate the formatted text between them.",
     "If a target contains inline preserve markers like [[CTX-PRESERVE-1]], keep each marker token exactly once and treat it as an untranslated footnote, line break, formula, media item, or inline object.",
     "Keep inline markers balanced and properly nested; never rename, duplicate, drop, or invent CTX-* markers.",
+    ...buildQualityRetryPromptLines(request.qualityRetry),
     "Return only JSON that matches the provided output schema.",
     "",
     "Input JSON:",
     JSON.stringify(input),
   ].join("\n");
+}
+
+function buildQualityRetryPromptLines(qualityRetry) {
+  if (!qualityRetry) {
+    return [];
+  }
+
+  const lines = [
+    "Quality retry: the previous output failed client-side validation.",
+    "Translate the target again and preserve every required marker, URL, and numeric token exactly.",
+  ];
+
+  if (qualityRetry.itemId) {
+    lines.push(`Affected target id: ${qualityRetry.itemId}.`);
+  }
+  if (qualityRetry.missingNumbers.length > 0) {
+    lines.push(`The previous output was missing these numeric tokens: ${qualityRetry.missingNumbers.join(", ")}.`);
+  }
+
+  return lines;
 }
 
 async function translateRequest(request) {

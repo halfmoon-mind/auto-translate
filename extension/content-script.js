@@ -169,6 +169,7 @@
   const PRIORITY_BATCH_MAX_TARGET_CHARS = 1200;
   const COLLECT_RETRY_DELAYS_MS = [250, 750];
   const MAX_RETRY_SPLIT_DEPTH = 6;
+  const MAX_SINGLE_ITEM_QUALITY_RETRIES = 1;
   const MAX_TRANSLATION_CACHE_ENTRIES = 500;
   const QUALITY_ERROR_PREFIX = "번역 품질 검증 실패";
 
@@ -285,7 +286,7 @@
         try {
           await endTranslationSession(sessionId);
         } catch (error) {
-          console.warn("Codex translation session cleanup failed.", error);
+          console.warn("Codex translation session cleanup failed.", getSafeErrorLogDetails(error));
         }
       }
       state.inProgress = false;
@@ -847,13 +848,34 @@
         return;
       }
 
-      console.warn("Codex translation batch failed.", error);
+      if (
+        batch.length === 1 &&
+        isQualityValidationError(error) &&
+        (options.qualityRetryCount || 0) < MAX_SINGLE_ITEM_QUALITY_RETRIES
+      ) {
+        const retryCount = (options.qualityRetryCount || 0) + 1;
+
+        logTranslationQualityFailure(error, batch, "retrying_single_item", retryCount);
+        await translateBatchWithRetry({
+          ...options,
+          qualityRetry: createQualityRetryHint(error),
+          qualityRetryCount: retryCount,
+        });
+        return;
+      }
+
+      if (isQualityValidationError(error)) {
+        logTranslationQualityFailure(error, batch, "failed", options.qualityRetryCount || 0);
+        console.warn("Codex translation batch failed.", getErrorMessage(error));
+      } else {
+        console.warn("Codex translation batch failed.", getSafeErrorLogDetails(error));
+      }
       options.progress.firstError ||= getErrorMessage(error);
       recordTranslationProgress(options, 0, batch.length);
     }
   }
 
-  async function requestTranslationBatch({ batch, page, context, index, totalBatches, sessionId }) {
+  async function requestTranslationBatch({ batch, page, context, index, totalBatches, sessionId, qualityRetry }) {
     const cachedById = new Map();
     const uncachedItems = [];
     const pendingItems = [];
@@ -899,6 +921,7 @@
           index,
           totalBatches,
           sessionId,
+          qualityRetry,
         });
         usage = result.usage;
 
@@ -947,7 +970,7 @@
     return { translations, usage };
   }
 
-  async function fetchTranslations({ items, page, context, index, totalBatches, sessionId }) {
+  async function fetchTranslations({ items, page, context, index, totalBatches, sessionId, qualityRetry }) {
     const response = await sendRuntimeMessage({
       type: "CODEX_LOCAL_TRANSLATE",
       sessionId,
@@ -963,6 +986,7 @@
           kind: item.kind,
           text: item.text,
         })),
+        ...(qualityRetry ? { qualityRetry } : {}),
       },
     });
 
@@ -1287,7 +1311,9 @@
 
     const markerNestingError = getInlineMarkerNestingError(item, text);
     if (markerNestingError) {
-      throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 인라인 마커 순서가 깨졌습니다 (${markerNestingError}).`);
+      throw new Error(
+        `${QUALITY_ERROR_PREFIX}: ${item.id} 인라인 마커 순서가 깨졌습니다 (${markerNestingError}).`,
+      );
     }
 
     const sourceText = stripInlineMarkers(item.text);
@@ -1301,10 +1327,117 @@
     const missingNumbers = getMissingNumbers(sourceText, targetText);
 
     if (missingNumbers.length > 0) {
-      throw new Error(
-        `${QUALITY_ERROR_PREFIX}: ${item.id} 숫자가 누락되었습니다 (${missingNumbers.join(", ")}).`,
-      );
+      throw createMissingNumbersQualityError(item, sourceText, targetText, missingNumbers);
     }
+  }
+
+  function createMissingNumbersQualityError(item, sourceText, targetText, missingNumbers) {
+    const error = new Error(
+      `${QUALITY_ERROR_PREFIX}: ${item.id} 숫자가 누락되었습니다 (${missingNumbers.length}개).`,
+    );
+
+    Object.defineProperty(error, "translationQuality", {
+      value: {
+        itemId: item.id,
+        kind: item.kind || "paragraph",
+        reason: "missing_numbers",
+        sourceLength: sourceText.length,
+        translatedLength: targetText.length,
+        sourceNumberCount: extractNumbers(sourceText).length,
+        translatedNumberCount: extractNumbers(targetText).length,
+        missingNumbers,
+      },
+    });
+    return error;
+  }
+
+  function isQualityValidationError(error) {
+    return Boolean(error?.translationQuality) || getErrorMessage(error).startsWith(QUALITY_ERROR_PREFIX);
+  }
+
+  function logTranslationQualityFailure(error, batch, action, retryAttempt) {
+    if (!isQualityValidationError(error)) {
+      return;
+    }
+
+    console.warn("Codex translation quality diagnostics.", {
+      action,
+      retryAttempt,
+      batchSize: batch.length,
+      ...getTranslationQualityLogDetails(error, batch),
+    });
+  }
+
+  function getTranslationQualityLogDetails(error, batch) {
+    const details = error.translationQuality;
+
+    if (!details) {
+      return {
+        itemIds: batch.map((item) => item.id).slice(0, 10),
+        message: getSafeErrorLogMessage(error),
+      };
+    }
+
+    return {
+      itemId: details.itemId,
+      kind: details.kind,
+      reason: details.reason,
+      sourceLength: details.sourceLength,
+      translatedLength: details.translatedLength,
+      sourceNumberCount: details.sourceNumberCount,
+      translatedNumberCount: details.translatedNumberCount,
+      missingNumberCount: Array.isArray(details.missingNumbers) ? details.missingNumbers.length : 0,
+    };
+  }
+
+  function createQualityRetryHint(error) {
+    const details = error?.translationQuality || {};
+
+    return {
+      itemId: details.itemId || "",
+      reason: details.reason || "quality_validation_failed",
+      missingNumbers: Array.isArray(details.missingNumbers) ? details.missingNumbers : [],
+    };
+  }
+
+  function getSafeErrorLogDetails(error) {
+    return {
+      name: error instanceof Error ? error.name : typeof error,
+      setupCode: typeof error?.setupCode === "string" ? error.setupCode : "",
+      message: getSafeErrorLogMessage(error),
+    };
+  }
+
+  function getSafeErrorLogMessage(error) {
+    const message = getErrorMessage(error);
+    const firstLine = message.split("\n")[0].trim();
+
+    if (isSafeErrorLogMessage(firstLine)) {
+      return firstLine;
+    }
+
+    return firstLine
+      ? "자세한 오류 메시지는 개인정보 보호를 위해 콘솔에서 생략되었습니다."
+      : "";
+  }
+
+  function isSafeErrorLogMessage(message) {
+    return (
+      message.startsWith(QUALITY_ERROR_PREFIX) ||
+      message.startsWith("Codex exited with code ") ||
+      message.startsWith("Codex timed out after ") ||
+      message.startsWith("Codex returned non-JSON output.") ||
+      [
+        "failed to fetch",
+        "local server responded",
+        "native messaging host",
+        "native host",
+        "not logged in",
+        "log in",
+        "unauthorized",
+        "authentication",
+      ].some((term) => message.toLowerCase().includes(term))
+    );
   }
 
   function getInvalidPairedTokens(entries, translatedText) {
