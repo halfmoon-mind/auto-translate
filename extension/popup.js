@@ -278,6 +278,11 @@ function renderElapsedText() {
     parts.push(usage);
   }
 
+  const timings = formatTimings(status.timings);
+  if (timings) {
+    parts.push(timings);
+  }
+
   elapsedText.textContent = parts.join(" · ");
 }
 
@@ -305,10 +310,14 @@ function formatWork(metrics) {
   const priorityBatchCount = Number.isFinite(metrics.priorityBatchCount)
     ? metrics.priorityBatchCount
     : 0;
+  const nativeRequestCount = Number.isFinite(metrics.nativeRequestCount)
+    ? metrics.nativeRequestCount
+    : 0;
+  const requestLabel = nativeRequestCount > 0 ? ` / 요청 ${nativeRequestCount}개` : "";
 
   return priorityBatchCount > 0
-    ? `배치 ${metrics.batchCount}개 / 우선 ${priorityBatchCount}개 / 동시 ${parallelRuns}개`
-    : `배치 ${metrics.batchCount}개 / 동시 ${parallelRuns}개`;
+    ? `배치 ${metrics.batchCount}개 / 우선 ${priorityBatchCount}개 / 동시 ${parallelRuns}개${requestLabel}`
+    : `배치 ${metrics.batchCount}개 / 동시 ${parallelRuns}개${requestLabel}`;
 }
 
 function formatUsage(usage) {
@@ -327,6 +336,63 @@ function formatUsage(usage) {
   return cost
     ? `${label} ${tokens} / API 환산 약 ${cost}`
     : `${label} ${tokens}`;
+}
+
+function formatTimings(timings) {
+  if (!timings || typeof timings !== "object") {
+    return "";
+  }
+
+  const parts = [];
+  const mode = formatTimingMode(timings.mode);
+  if (mode) {
+    parts.push(mode);
+  }
+  addTimingPart(parts, "수집", timings.collectMs);
+  addTimingPart(parts, "세션", timings.sessionStartMs);
+  addTimingPart(parts, "브리지", timings.nativeRoundTripMaxMs || timings.nativeRoundTripMs);
+  addTimingPart(parts, "로컬", timings.serverTotalMaxMs || timings.serverTotalMs);
+  addTimingPart(parts, "원샷", timings.oneShotMs);
+  addTimingPart(parts, "thread", timings.threadStartMaxMs || timings.threadStartMs);
+  addTimingPart(parts, "turn", timings.turnWaitMaxMs || timings.turnWaitMs);
+  addTimingPart(parts, "검증", timings.validationMaxMs || timings.validationMs);
+
+  const retries = readOptionalNumber(timings.codexRetries);
+  if (retries) {
+    parts.push(`재시도 ${Math.round(retries)}회`);
+  }
+
+  return parts.length > 0 ? `계측 ${parts.join(" / ")}` : "";
+}
+
+function formatTimingMode(mode) {
+  if (mode === "one_shot") {
+    return "원샷";
+  }
+  if (mode === "split_after_one_shot") {
+    return "원샷 후 분해";
+  }
+  if (mode === "split") {
+    return "분해";
+  }
+
+  return "";
+}
+
+function addTimingPart(parts, label, value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return;
+  }
+
+  parts.push(`${label} ${formatCompactDuration(value)}`);
+}
+
+function formatCompactDuration(milliseconds) {
+  if (milliseconds < 1000) {
+    return `${Math.round(milliseconds)}ms`;
+  }
+
+  return formatDuration(milliseconds);
 }
 
 function normalizeUsage(usage) {

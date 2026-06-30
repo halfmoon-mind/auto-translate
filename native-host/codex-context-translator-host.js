@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-const { getBridgeInfo, translatePayload } = require("../server/translator");
+const { getBridgeInfo, shutdownTranslator, translatePayload } = require("../server/translator");
 
 let buffer = Buffer.alloc(0);
 let activeMessages = 0;
 let pendingWrites = 0;
 let stdinEnded = false;
+let exiting = false;
 
 process.stdin.on("data", (chunk) => {
   buffer = Buffer.concat([buffer, chunk]);
@@ -73,6 +74,7 @@ async function handleMessage(message) {
       translations: result.translations,
       runs: result.runs,
       usage: result.usage,
+      timings: result.timings,
       source: "native",
     };
   }
@@ -113,9 +115,14 @@ function withRequestId(response, requestMessage) {
   };
 }
 
-function exitWhenIdle() {
-  if (stdinEnded && activeMessages === 0 && pendingWrites === 0) {
-    process.exit(0);
+async function exitWhenIdle() {
+  if (stdinEnded && activeMessages === 0 && pendingWrites === 0 && !exiting) {
+    exiting = true;
+    try {
+      await shutdownTranslator();
+    } finally {
+      process.exit(0);
+    }
   }
 }
 

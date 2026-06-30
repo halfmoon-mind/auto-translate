@@ -162,11 +162,10 @@
   const ANY_FORMAT_MARKER_PATTERN = /\[\[\/?CTX-FMT-\d+\]\]/g;
   const MAX_CONTEXT_ITEMS = 12;
   const MAX_CONTEXT_SNIPPET_CHARS = 120;
-  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 10;
-  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 3000;
-  const ESTIMATE_MAX_PARALLEL_RUNS = 8;
-  const PRIORITY_BATCH_MAX_PARAGRAPHS = 4;
-  const PRIORITY_BATCH_MAX_TARGET_CHARS = 1200;
+  const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 18;
+  const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 6000;
+  const PRIORITY_BATCH_MAX_PARAGRAPHS = 8;
+  const PRIORITY_BATCH_MAX_TARGET_CHARS = 2500;
   const COLLECT_RETRY_DELAYS_MS = [250, 750];
   const MAX_RETRY_SPLIT_DEPTH = 6;
   const MAX_SINGLE_ITEM_QUALITY_RETRIES = 1;
@@ -216,13 +215,16 @@
     const startedAt = Date.now();
     let metrics = null;
     let sessionId = null;
+    const clientTimings = {};
 
     state.inProgress = true;
     ensureStyle();
 
     try {
       publishStatus("collecting", "번역할 단락을 찾는 중입니다.", null, null, { startedAt });
+      const collectStartedAt = Date.now();
       const items = await collectItemsWhenReady();
+      clientTimings.collectMs = Date.now() - collectStartedAt;
 
       if (items.length === 0) {
         throw new Error("번역할 단락을 찾지 못했습니다.");
@@ -237,7 +239,9 @@
         startedAt,
         metrics,
       });
+      const sessionStartedAt = Date.now();
       const session = await startTranslationSession();
+      clientTimings.sessionStartMs = Date.now() - sessionStartedAt;
       sessionId = session.sessionId;
       metrics = addProjectedUsage(metrics, context, session.pricing);
       publishStatus("translating", `${items.length}개 단락을 자동 번역 중입니다.`, 0, items.length, {
@@ -256,6 +260,8 @@
       });
 
       const elapsedMs = Date.now() - startedAt;
+      const timings = mergeTimingValues(clientTimings, result.timings);
+      timings.totalElapsedMs = elapsedMs;
       const message = result.failed
         ? `${result.translated}개 단락을 번역했고 ${result.failed}개는 실패했습니다.`
         : `${result.translated}개 단락을 번역했습니다.`;
@@ -264,6 +270,7 @@
         elapsedMs,
         metrics,
         usage: result.usage,
+        timings,
         failed: result.failed,
       });
       return {
@@ -273,12 +280,14 @@
         elapsedMs,
         metrics,
         usage: result.usage,
+        timings,
       };
     } catch (error) {
       publishStatus("failed", getErrorMessage(error), null, null, {
         startedAt,
         elapsedMs: Date.now() - startedAt,
         metrics,
+        timings: clientTimings,
       });
       throw error;
     } finally {
@@ -730,19 +739,16 @@
   function estimateTranslationWork(items, batches) {
     const targetChars = items.reduce((sum, item) => sum + item.text.length, 0);
     const batchCount = batches.length;
-    const parallelRuns = batchCount > 0
-      ? Math.min(ESTIMATE_MAX_PARALLEL_RUNS, batchCount)
-      : 0;
+    const nativeRequestCount = batchCount > 0 ? 1 : 0;
+    const parallelRuns = nativeRequestCount;
     const priorityBatchCount = countPriorityBatches(batches);
-    const regularBatchCount = batchCount - priorityBatchCount;
-    const waveCount = parallelRuns > 0
-      ? Math.ceil(priorityBatchCount / parallelRuns) + Math.ceil(regularBatchCount / parallelRuns)
-      : 0;
+    const waveCount = nativeRequestCount;
 
     return {
       targetCount: items.length,
       targetChars,
       batchCount,
+      nativeRequestCount,
       parallelRuns,
       waveCount,
       priorityBatchCount,
@@ -750,41 +756,24 @@
   }
 
   async function translateBatches({ batches, page, context, startedAt, metrics, totalItems, sessionId }) {
-    const progress = { translated: 0, failed: 0, firstError: null, usage: null };
-    const batchJobs = batches.map((batch, index) => ({ batch, index }));
-    const priorityJobs = batchJobs.filter((job) => isPriorityBatch(job.batch));
-    const regularJobs = batchJobs.filter((job) => !isPriorityBatch(job.batch));
+    const progress = { translated: 0, failed: 0, firstError: null, usage: null, timings: null };
+    const orderedBatch = batches
+      .map((batch, index) => ({ batch, index }))
+      .sort(compareBatchJobs)
+      .flatMap((job) => job.batch);
 
-    await mapWithConcurrency(priorityJobs, ESTIMATE_MAX_PARALLEL_RUNS, async ({ batch, index }) => {
-      await translateBatchWithRetry({
-        batch,
-        page,
-        context,
-        index,
-        totalBatches: batches.length,
-        startedAt,
-        metrics,
-        totalItems,
-        progress,
-        depth: 0,
-        sessionId,
-      });
-    });
-
-    await mapWithConcurrency(regularJobs, ESTIMATE_MAX_PARALLEL_RUNS, async ({ batch, index }) => {
-      await translateBatchWithRetry({
-        batch,
-        page,
-        context,
-        index,
-        totalBatches: batches.length,
-        startedAt,
-        metrics,
-        totalItems,
-        progress,
-        depth: 0,
-        sessionId,
-      });
+    await translateBatchWithRetry({
+      batch: orderedBatch,
+      page,
+      context,
+      index: 0,
+      totalBatches: 1,
+      startedAt,
+      metrics,
+      totalItems,
+      progress,
+      depth: 0,
+      sessionId,
     });
 
     if (progress.translated === 0 && progress.failed > 0) {
@@ -798,6 +787,12 @@
     return progress;
   }
 
+  function compareBatchJobs(left, right) {
+    const leftPriority = isPriorityBatch(left.batch) ? 0 : 1;
+    const rightPriority = isPriorityBatch(right.batch) ? 0 : 1;
+    return leftPriority - rightPriority || left.index - right.index;
+  }
+
   function countPriorityBatches(batches) {
     return batches.reduce((count, batch) => count + (isPriorityBatch(batch) ? 1 : 0), 0);
   }
@@ -806,26 +801,13 @@
     return batch.some((item) => getViewportRank(item.element).group === 0);
   }
 
-  async function mapWithConcurrency(items, concurrency, mapper) {
-    let nextIndex = 0;
-    const workerCount = Math.min(concurrency, items.length);
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (nextIndex < items.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        await mapper(items[index], index);
-      }
-    });
-
-    await Promise.all(workers);
-  }
-
   async function translateBatchWithRetry(options) {
     const { batch, depth } = options;
 
     try {
       const result = await requestTranslationBatch(options);
       addUsage(options.progress, result.usage);
+      addTimings(options.progress, result.timings);
       const translations = result.translations;
       const translated = applyTranslations(batch, translations);
       recordTranslationProgress(options, translated, batch.length - translated);
@@ -903,6 +885,7 @@
     const fetchedByKey = new Map();
     const pendingByCacheKey = new Map();
     let usage = null;
+    let timings = null;
 
     if (uniqueItems.length > 0) {
       for (const item of uniqueItems) {
@@ -924,6 +907,7 @@
           qualityRetry,
         });
         usage = result.usage;
+        timings = result.timings;
 
         for (const item of uniqueItems) {
           const translatedText = result.translations.get(item.id);
@@ -967,10 +951,11 @@
       translations.push({ id: item.id, text: translatedText });
     }
 
-    return { translations, usage };
+    return { translations, usage, timings };
   }
 
   async function fetchTranslations({ items, page, context, index, totalBatches, sessionId, qualityRetry }) {
+    const startedAt = Date.now();
     const response = await sendRuntimeMessage({
       type: "CODEX_LOCAL_TRANSLATE",
       sessionId,
@@ -997,6 +982,10 @@
     return {
       translations: normalizeTranslationResponse(items, response.translations || []),
       usage: response.usage || null,
+      timings: {
+        ...(response.timings || {}),
+        nativeRoundTripMs: Date.now() - startedAt,
+      },
     };
   }
 
@@ -1033,6 +1022,84 @@
     }
 
     progress.usage = sumUsage(progress.usage, normalizedUsage);
+  }
+
+  function addTimings(progress, timings) {
+    progress.timings = mergeTimingValues(progress.timings, timings);
+  }
+
+  function mergeTimingValues(current, next) {
+    const merged = current && typeof current === "object" ? { ...current } : {};
+    if (!next || typeof next !== "object") {
+      return Object.keys(merged).length > 0 ? merged : null;
+    }
+
+    const sumFields = [
+      "collectMs",
+      "sessionStartMs",
+      "nativeRoundTripMs",
+      "normalizeMs",
+      "serverRequestMs",
+      "serverTotalMs",
+      "serverBatchCount",
+      "promptBuildMs",
+      "appServerStartMs",
+      "threadStartMs",
+      "turnStartMs",
+      "turnWaitMs",
+      "parseMs",
+      "validationMs",
+      "codexTotalMs",
+      "retryDelayMs",
+      "codexAttempts",
+      "codexRetries",
+      "targetCount",
+      "targetChars",
+      "oneShotMs",
+      "oneShotEstimatedTokens",
+    ];
+    const maxFields = ["serverParallelRuns"];
+    const stringFields = ["mode", "oneShotReason", "oneShotFailure"];
+    const booleanFields = ["oneShotEligible", "oneShotFallback"];
+
+    for (const field of sumFields) {
+      const value = readOptionalNumber(next[field]);
+      if (value === null) {
+        continue;
+      }
+
+      merged[field] = (readOptionalNumber(merged[field]) || 0) + value;
+
+      if (field.endsWith("Ms")) {
+        const maxField = field.replace(/Ms$/, "MaxMs");
+        merged[maxField] = Math.max(readOptionalNumber(merged[maxField]) || 0, value);
+      }
+    }
+
+    for (const field of maxFields) {
+      const value = readOptionalNumber(next[field]);
+      if (value !== null) {
+        merged[field] = Math.max(readOptionalNumber(merged[field]) || 0, value);
+      }
+    }
+
+    for (const field of stringFields) {
+      if (typeof next[field] === "string" && next[field]) {
+        merged[field] = next[field];
+      }
+    }
+
+    for (const field of booleanFields) {
+      if (typeof next[field] === "boolean") {
+        merged[field] = next[field];
+      }
+    }
+
+    if (Array.isArray(next.runs)) {
+      merged.runs = [...(Array.isArray(merged.runs) ? merged.runs : []), ...next.runs].slice(-40);
+    }
+
+    return Object.keys(merged).length > 0 ? merged : null;
   }
 
   function addProjectedUsage(metrics, context, pricing) {

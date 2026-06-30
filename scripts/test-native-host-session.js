@@ -72,6 +72,10 @@ async function testHealthAndTranslate(fakeCodexPath) {
   assert.equal(typeof translate.usage.inputTokens, "number");
   assert.equal(typeof translate.usage.outputTokens, "number");
   assert.equal(translate.usage.costBasis.source, "https://developers.openai.com/api/docs/pricing");
+  assert.equal(translate.timings.mode, "one_shot");
+  assert.equal(translate.timings.serverBatchCount, 1);
+  assert.equal(typeof translate.timings.threadStartMs, "number");
+  assert.equal(typeof translate.timings.turnWaitMs, "number");
 }
 
 function sendNativeMessages(messages, env = {}) {
@@ -162,29 +166,118 @@ function createFakeCodex() {
   const scriptPath = path.join(dir, "fake-codex.js");
   const script = `#!/usr/bin/env node
 
-let input = "";
+const readline = require("node:readline");
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  input += chunk;
-});
-process.stdin.on("end", () => {
-  const marker = "Input JSON:\\n";
-  const markerIndex = input.lastIndexOf(marker);
+let nextThreadId = 1;
+let nextTurnId = 1;
 
-  if (markerIndex < 0) {
-    console.error("Missing Input JSON marker.");
-    process.exit(1);
+const rl = readline.createInterface({ input: process.stdin });
+
+rl.on("line", (line) => {
+  if (!line.trim()) {
+    return;
   }
 
-  const parsed = JSON.parse(input.slice(markerIndex + marker.length));
-  const translations = parsed.targets.map((target) => ({
-    id: target.id,
-    text: "ko:" + target.text,
-  }));
+  const message = JSON.parse(line);
 
-  process.stdout.write(JSON.stringify({ translations }));
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+
+  if (message.method === "initialized") {
+    return;
+  }
+
+  if (message.method === "thread/start") {
+    send({
+      id: message.id,
+      result: {
+        thread: {
+          id: "thread-" + nextThreadId,
+        },
+      },
+    });
+    nextThreadId += 1;
+    return;
+  }
+
+  if (message.method === "turn/start") {
+    const turnId = "turn-" + nextTurnId;
+    nextTurnId += 1;
+    send({
+      id: message.id,
+      result: {
+        turn: {
+          id: turnId,
+        },
+      },
+    });
+
+    const prompt = message.params.input[0].text;
+    const marker = "Input JSON:\\n";
+    const markerIndex = prompt.lastIndexOf(marker);
+
+    if (markerIndex < 0) {
+      send({
+        method: "turn/completed",
+        params: {
+          turn: {
+            id: turnId,
+            status: "failed",
+            error: {
+              message: "Missing Input JSON marker.",
+            },
+          },
+        },
+      });
+      return;
+    }
+
+    const parsed = JSON.parse(prompt.slice(markerIndex + marker.length));
+    const text = JSON.stringify({
+      translations: parsed.targets.map((target) => ({
+        id: target.id,
+        text: "ko:" + target.text,
+      })),
+    });
+    const item = {
+      type: "agentMessage",
+      phase: "final",
+      text,
+    };
+
+    send({
+      method: "item/completed",
+      params: {
+        turnId,
+        item,
+      },
+    });
+    send({
+      method: "turn/completed",
+      params: {
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [item],
+        },
+      },
+    });
+    return;
+  }
+
+  send({
+    id: message.id,
+    error: {
+      message: "Unsupported fake codex method.",
+    },
+  });
 });
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
 `;
 
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Codex Context Translator",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Translate visible page paragraphs into Korean through a local Codex native bridge.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0M92rykCUrZ0EbVXgQRMAvv1uz1/nQxFkosMZ5MFFJ64P1AEl7vTKJVJGK+ArzNFvvDEj53x3c31XJFJovJn4+gNswIpkKk/wuikPbfoF7T0kCtaKO4PW//Kpem4oA5PLzD3GtKNM1i+/gz9DE53qdfJMhhrar2FNU9V+nRy4GGub8mvMZCWL2PpOJxnveWyzn+oLjoICiSVhxhRLOW4XeAo2bIPSP4Fx0zgtUrq1m2Bc+JkFfsSbJQDpfYgou8z4qCOgH7yXy8E6Q3UoN2PMxiPaiRQmveXaLrWH6TntKWs0AVN8sfGBuEA71N0zxtk0fwFEntj8fS/EqLPcRWrlwIDAQAB",
   "permissions": ["activeTab", "scripting", "nativeMessaging"],

@@ -35,7 +35,7 @@ Install the native bridge once:
 3. Confirm the completion dialog.
 4. Use the opened setup page to run `다시 확인`.
 
-Chrome launches the native host only while it is handling a health check or translation session. During a page translation, the extension keeps one native messaging port open so translation batches can reuse the same host process. There is no long-running background server process to keep alive.
+Chrome launches the native host only while it is handling a health check or translation session. During a page translation, the extension keeps one native messaging port open so translation batches can reuse the same host process. The native host starts `codex app-server` for that translation session and shuts it down when the session ends; there is no long-running background server process to keep alive.
 
 If the bridge is missing or cannot start, the extension popup shows `설정 열기`. That opens an in-extension setup page, so users do not need to hunt through this README to understand the next step.
 
@@ -120,20 +120,25 @@ The native bridge defaults prioritize speed:
 CODEX_TRANSLATOR_MODEL=gpt-5.4-mini
 CODEX_TRANSLATOR_EFFORT=low
 CODEX_TRANSLATOR_TIMEOUT_MS=180000
+CODEX_TRANSLATOR_APP_SERVER_REQUEST_TIMEOUT_MS=30000
 CODEX_TRANSLATOR_MAX_CONTEXT_CHARS=6000
 CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN=20
 CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN=7000
 CODEX_TRANSLATOR_MAX_PARALLEL_RUNS=4
+CODEX_TRANSLATOR_ONE_SHOT_MAX_PARAGRAPHS=120
+CODEX_TRANSLATOR_ONE_SHOT_MAX_TARGET_CHARS=12000
+CODEX_TRANSLATOR_ONE_SHOT_MAX_TOTAL_TOKENS=16000
+CODEX_TRANSLATOR_ONE_SHOT_MAX_SINGLE_TARGET_CHARS=5000
 ```
 
 Set `CODEX_TRANSLATOR_MODEL=` to let Codex use its default model. Set `CODEX_TRANSLATOR_MODEL=gpt-5.3-codex-spark` if you have Spark quota and want the faster profile. `CODEX_TRANSLATOR_EFFORT=fast` is accepted as an alias for Codex's `low` reasoning effort.
 
 ## API-Key Avoidance
 
-The native bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child process environment and passes `forced_login_method="chatgpt"` to `codex exec`. It also disables the shell tool for translation runs. If the local Codex CLI is not logged in with ChatGPT, translation fails instead of falling back to API-key billing.
+The native bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child process environment and passes `forced_login_method="chatgpt"` to `codex app-server`. It also disables the shell tool for translation runs. If the local Codex CLI is not logged in with ChatGPT, translation fails instead of falling back to API-key billing.
 
 ## Maintenance Notes
 
-- Pages are translated in small batches. Larger pages can run several batches in parallel.
+- The extension sends one translation request per page translation. The local native host tries a guarded one-shot translation first, then falls back to medium-sized split runs when the page is too large or the one-shot output fails validation.
 - Large pages can still consume Codex usage quickly because the page text is sent as translation input.
 - The extension replaces paragraph text in the page. Use `원문 복원` before re-translating.

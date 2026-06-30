@@ -1,7 +1,9 @@
 const path = require("node:path");
 const fs = require("node:fs");
+const readline = require("node:readline");
 const { spawn } = require("node:child_process");
 const PRICING_SNAPSHOT = require("./openai-pricing-snapshot.json");
+const TRANSLATION_SCHEMA = require("./translation-schema.json");
 
 const CODEX_BIN = process.env.CODEX_TRANSLATOR_CODEX_BIN || "codex";
 const REQUIRED_NODE_MAJOR = 18;
@@ -11,6 +13,10 @@ const MODEL = process.env.CODEX_TRANSLATOR_MODEL ?? DEFAULT_MODEL;
 const EFFORT = normalizeEffort(process.env.CODEX_TRANSLATOR_EFFORT || DEFAULT_EFFORT);
 const TIMEOUT_MS = Number.parseInt(
   process.env.CODEX_TRANSLATOR_TIMEOUT_MS || "180000",
+  10,
+);
+const APP_SERVER_REQUEST_TIMEOUT_MS = Number.parseInt(
+  process.env.CODEX_TRANSLATOR_APP_SERVER_REQUEST_TIMEOUT_MS || "30000",
   10,
 );
 const MAX_CONTEXT_CHARS = Number.parseInt(
@@ -29,6 +35,22 @@ const MAX_PARALLEL_RUNS = Math.min(
   4,
   Math.max(1, Number.parseInt(process.env.CODEX_TRANSLATOR_MAX_PARALLEL_RUNS || "4", 10) || 4),
 );
+const ONE_SHOT_MAX_PARAGRAPHS = Number.parseInt(
+  process.env.CODEX_TRANSLATOR_ONE_SHOT_MAX_PARAGRAPHS || "120",
+  10,
+);
+const ONE_SHOT_MAX_TARGET_CHARS = Number.parseInt(
+  process.env.CODEX_TRANSLATOR_ONE_SHOT_MAX_TARGET_CHARS || "12000",
+  10,
+);
+const ONE_SHOT_MAX_TOTAL_TOKENS = Number.parseInt(
+  process.env.CODEX_TRANSLATOR_ONE_SHOT_MAX_TOTAL_TOKENS || "16000",
+  10,
+);
+const ONE_SHOT_MAX_SINGLE_TARGET_CHARS = Number.parseInt(
+  process.env.CODEX_TRANSLATOR_ONE_SHOT_MAX_SINGLE_TARGET_CHARS || "5000",
+  10,
+);
 const CODEX_RETRY_DELAYS_MS = parseRetryDelays(
   process.env.CODEX_TRANSLATOR_RETRY_DELAYS_MS || "2000,5000,10000",
 );
@@ -40,7 +62,15 @@ const MAX_CODEX_ATTEMPTS = Math.max(
   ) || 1,
 );
 const MAX_STDIO_BYTES = 2 * 1024 * 1024;
-const SCHEMA_PATH = path.join(__dirname, "translation-schema.json");
+const APP_SERVER_CWD = path.join(__dirname, "..");
+const APP_SERVER_BASE_INSTRUCTIONS = [
+  "You are a web-page translation engine.",
+  "Translate only the user-provided source text and return the final response as JSON.",
+].join(" ");
+const APP_SERVER_DEVELOPER_INSTRUCTIONS = [
+  "Do not browse, inspect files, run tools, edit files, summarize, or answer the source content.",
+  "Follow the user's translation prompt and output schema exactly.",
+].join("\n");
 const TARGET_KINDS = new Set([
   "heading",
   "paragraph",
@@ -50,6 +80,8 @@ const TARGET_KINDS = new Set([
   "table_cell",
   "definition",
 ]);
+let codexAppServer = null;
+let codexAppServerStartPromise = null;
 
 function getBridgeInfo() {
   const nodeStatus = getNodeStatus();
@@ -61,6 +93,9 @@ function getBridgeInfo() {
     node: process.version,
     maxParagraphsPerRun: MAX_PARAGRAPHS_PER_RUN,
     maxParallelRuns: MAX_PARALLEL_RUNS,
+    oneShotMaxParagraphs: getPositiveLimit(ONE_SHOT_MAX_PARAGRAPHS, 120),
+    oneShotMaxTargetChars: getPositiveLimit(ONE_SHOT_MAX_TARGET_CHARS, 12000),
+    oneShotMaxTotalTokens: getPositiveLimit(ONE_SHOT_MAX_TOTAL_TOKENS, 16000),
     pricing: getUsagePricingInfo(),
   };
 
@@ -129,8 +164,20 @@ function isExecutable(filePath) {
 }
 
 async function translatePayload(payload) {
+  const startedAt = Date.now();
+  const normalizeStartedAt = Date.now();
   const request = normalizeTranslateRequest(payload);
-  return translateRequest(request);
+  const normalizeMs = Date.now() - normalizeStartedAt;
+  const result = await translateRequest(request);
+
+  return {
+    ...result,
+    timings: {
+      ...result.timings,
+      normalizeMs,
+      serverTotalMs: Date.now() - startedAt,
+    },
+  };
 }
 
 function normalizeTranslateRequest(payload) {
@@ -305,30 +352,205 @@ function buildQualityRetryPromptLines(qualityRetry) {
 }
 
 async function translateRequest(request) {
+  const startedAt = Date.now();
+  const oneShotDecision = getOneShotDecision(request);
+
+  if (oneShotDecision.useOneShot) {
+    const oneShotStartedAt = Date.now();
+
+    try {
+      const result = await translateParagraphRun(request, request.paragraphs, {
+        index: 1,
+        total: 1,
+        mode: "one_shot",
+      });
+
+      return buildTranslationResult([result], startedAt, {
+        mode: "one_shot",
+        oneShotEligible: true,
+        oneShotReason: oneShotDecision.reason,
+        oneShotEstimatedTokens: oneShotDecision.estimatedTotalTokens,
+        oneShotMs: Date.now() - oneShotStartedAt,
+      });
+    } catch (error) {
+      if (!shouldFallbackToSplit(error)) {
+        throw error;
+      }
+
+      return translateSplitRequest(request, startedAt, {
+        mode: "split_after_one_shot",
+        oneShotEligible: true,
+        oneShotReason: oneShotDecision.reason,
+        oneShotEstimatedTokens: oneShotDecision.estimatedTotalTokens,
+        oneShotFallback: true,
+        oneShotFailure: getFallbackReason(error),
+        oneShotMs: Date.now() - oneShotStartedAt,
+      });
+    }
+  }
+
+  return translateSplitRequest(request, startedAt, {
+    mode: "split",
+    oneShotEligible: false,
+    oneShotReason: oneShotDecision.reason,
+    oneShotEstimatedTokens: oneShotDecision.estimatedTotalTokens,
+  });
+}
+
+async function translateSplitRequest(request, startedAt, baseTimings) {
   const batches = createTranslationBatches(request.paragraphs);
   const batchResults = await mapWithConcurrency(batches, MAX_PARALLEL_RUNS, async (paragraphs, index) => {
-    const prompt = buildPrompt({
-      ...request,
-      batch: {
-        index: index + 1,
-        total: batches.length,
-      },
-      paragraphs,
+    return translateParagraphRun(request, paragraphs, {
+      index: index + 1,
+      total: batches.length,
+      mode: "split",
     });
-    const codexResult = await runCodexWithRetry(prompt);
-    const translations = normalizeTranslations(codexResult, paragraphs);
-
-    return {
-      translations,
-      usage: estimateUsage(prompt, translations),
-    };
   });
+
+  return buildTranslationResult(batchResults, startedAt, {
+    ...baseTimings,
+    serverBatchCount: batches.length,
+    serverParallelRuns: Math.min(MAX_PARALLEL_RUNS, batches.length),
+  });
+}
+
+async function translateParagraphRun(request, paragraphs, batch) {
+  const promptStartedAt = Date.now();
+  const prompt = buildPrompt({
+    ...request,
+    batch: {
+      index: batch.index,
+      total: batch.total,
+    },
+    paragraphs,
+  });
+  const promptBuildMs = Date.now() - promptStartedAt;
+  const codexRun = await runCodexWithRetry(prompt);
+  const validationStartedAt = Date.now();
+  const translations = normalizeTranslations(codexRun.result, paragraphs);
+  const validationMs = Date.now() - validationStartedAt;
+
+  return {
+    translations,
+    usage: estimateUsage(prompt, translations),
+    timings: {
+      ...codexRun.timings,
+      index: batch.index,
+      mode: batch.mode,
+      targetCount: paragraphs.length,
+      targetChars: getParagraphTextLength(paragraphs),
+      promptBuildMs,
+      validationMs,
+    },
+  };
+}
+
+function buildTranslationResult(batchResults, startedAt, baseTimings) {
+  const runTimings = batchResults.map((result) => result.timings);
 
   return {
     translations: batchResults.flatMap((result) => result.translations),
-    runs: batches.length,
+    runs: batchResults.length,
     usage: sumUsage(batchResults.map((result) => result.usage)),
+    timings: summarizeRunTimings(runTimings, {
+      ...baseTimings,
+      serverRequestMs: Date.now() - startedAt,
+      serverBatchCount: baseTimings.serverBatchCount ?? batchResults.length,
+      serverParallelRuns: baseTimings.serverParallelRuns ?? Math.min(MAX_PARALLEL_RUNS, batchResults.length),
+    }),
   };
+}
+
+function getOneShotDecision(request) {
+  if (request.qualityRetry) {
+    return { useOneShot: false, reason: "quality_retry" };
+  }
+
+  const targetCount = request.paragraphs.length;
+  const targetChars = getParagraphTextLength(request.paragraphs);
+  const maxTargetChars = request.paragraphs.reduce(
+    (max, paragraph) => Math.max(max, paragraph.text.length),
+    0,
+  );
+  const maxParagraphs = getPositiveLimit(ONE_SHOT_MAX_PARAGRAPHS, 120);
+  const maxTargetTotalChars = getPositiveLimit(ONE_SHOT_MAX_TARGET_CHARS, 12000);
+  const maxTotalTokens = getPositiveLimit(ONE_SHOT_MAX_TOTAL_TOKENS, 16000);
+  const maxSingleTargetChars = getPositiveLimit(ONE_SHOT_MAX_SINGLE_TARGET_CHARS, 5000);
+
+  if (targetCount > maxParagraphs) {
+    return { useOneShot: false, reason: "too_many_targets", targetCount };
+  }
+  if (targetChars > maxTargetTotalChars) {
+    return { useOneShot: false, reason: "too_many_chars", targetChars };
+  }
+  if (maxTargetChars > maxSingleTargetChars) {
+    return { useOneShot: false, reason: "single_target_too_large", maxTargetChars };
+  }
+
+  const estimatedTotalTokens = estimateOneShotTotalTokens(request);
+  if (estimatedTotalTokens > maxTotalTokens) {
+    return {
+      useOneShot: false,
+      reason: "too_many_tokens",
+      estimatedTotalTokens,
+    };
+  }
+
+  return {
+    useOneShot: true,
+    reason: "within_limits",
+    targetCount,
+    targetChars,
+    estimatedTotalTokens,
+  };
+}
+
+function estimateOneShotTotalTokens(request) {
+  const prompt = buildPrompt({
+    ...request,
+    batch: {
+      index: 1,
+      total: 1,
+    },
+    paragraphs: request.paragraphs,
+  });
+  const outputShape = {
+    translations: request.paragraphs.map((paragraph) => ({
+      id: paragraph.id,
+      text: paragraph.text,
+    })),
+  };
+
+  return estimateTokenCount(prompt) + estimateTokenCount(JSON.stringify(outputShape));
+}
+
+function shouldFallbackToSplit(error) {
+  const message = getErrorMessage(error).toLowerCase();
+  return !isAuthenticationErrorMessage(message);
+}
+
+function getFallbackReason(error) {
+  const message = getErrorMessage(error).toLowerCase();
+
+  if (message.includes("timed out") || message.includes("timeout")) {
+    return "timeout";
+  }
+  if (message.includes("json")) {
+    return "invalid_json";
+  }
+  if (message.includes("translation") || message.includes("paragraph")) {
+    return "missing_translation";
+  }
+
+  return "run_failed";
+}
+
+function getParagraphTextLength(paragraphs) {
+  return paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0);
+}
+
+function getPositiveLimit(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 async function mapWithConcurrency(items, concurrency, mapper) {
@@ -387,10 +609,20 @@ function createTranslationBatches(paragraphs) {
 
 async function runCodexWithRetry(prompt) {
   let lastError = null;
+  const timings = {
+    codexAttempts: 0,
+    codexRetries: 0,
+    retryDelayMs: 0,
+  };
 
   for (let attempt = 1; attempt <= MAX_CODEX_ATTEMPTS; attempt += 1) {
+    timings.codexAttempts = attempt;
     try {
-      return await runCodex(prompt);
+      const result = await runCodex(prompt);
+      return {
+        result: result.result,
+        timings: mergeTimingValues(timings, result.timings),
+      };
     } catch (error) {
       lastError = error;
 
@@ -401,6 +633,8 @@ async function runCodexWithRetry(prompt) {
       const delayMs = CODEX_RETRY_DELAYS_MS[
         Math.min(attempt - 1, CODEX_RETRY_DELAYS_MS.length - 1)
       ] || 0;
+      timings.codexRetries += 1;
+      timings.retryDelayMs += delayMs;
       await wait(delayMs);
     }
   }
@@ -408,20 +642,103 @@ async function runCodexWithRetry(prompt) {
   throw lastError;
 }
 
-function runCodex(prompt) {
-  return new Promise((resolve, reject) => {
+async function runCodex(prompt) {
+  const startedAt = Date.now();
+  const appServerStartedAt = Date.now();
+  const appServer = await getCodexAppServer();
+  const appServerStartMs = Date.now() - appServerStartedAt;
+
+  try {
+    const result = await appServer.runPrompt(prompt);
+    return {
+      result: result.result,
+      timings: {
+        ...result.timings,
+        appServerStartMs,
+        codexTotalMs: Date.now() - startedAt,
+      },
+    };
+  } catch (error) {
+    if (appServer.closed) {
+      resetCodexAppServer(appServer);
+    }
+    throw error;
+  }
+}
+
+async function getCodexAppServer() {
+  if (codexAppServer && !codexAppServer.closed) {
+    await codexAppServer.start();
+    return codexAppServer;
+  }
+
+  if (codexAppServerStartPromise) {
+    return codexAppServerStartPromise;
+  }
+
+  const appServer = new CodexAppServerClient();
+  codexAppServer = appServer;
+  codexAppServerStartPromise = appServer.start()
+    .then(() => appServer)
+    .catch((error) => {
+      resetCodexAppServer(appServer);
+      throw error;
+    })
+    .finally(() => {
+      if (codexAppServer === appServer) {
+        codexAppServerStartPromise = null;
+      }
+    });
+
+  return codexAppServerStartPromise;
+}
+
+function resetCodexAppServer(appServer) {
+  if (codexAppServer === appServer) {
+    codexAppServer = null;
+  }
+  codexAppServerStartPromise = null;
+}
+
+async function shutdownTranslator() {
+  const appServer = codexAppServer;
+  codexAppServer = null;
+  codexAppServerStartPromise = null;
+
+  if (appServer) {
+    await appServer.shutdown();
+  }
+}
+
+class CodexAppServerClient {
+  constructor() {
+    this.child = null;
+    this.readline = null;
+    this.pending = new Map();
+    this.turns = new Map();
+    this.nextId = 1;
+    this.stderr = "";
+    this.startPromise = null;
+    this.closed = false;
+  }
+
+  async start() {
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+
+    this.startPromise = this.startProcess();
+    return this.startPromise;
+  }
+
+  async startProcess() {
     const args = [
-      "exec",
-      "--ephemeral",
-      "--skip-git-repo-check",
-      "--ignore-rules",
-      "--ignore-user-config",
+      "app-server",
+      "--stdio",
       "--disable",
       "shell_tool",
       "--disable",
       "imagegenext",
-      "--sandbox",
-      "read-only",
       "-c",
       'forced_login_method="chatgpt"',
       "-c",
@@ -432,74 +749,288 @@ function runCodex(prompt) {
       'model_verbosity="low"',
       "-c",
       'web_search="disabled"',
-      "--output-schema",
-      SCHEMA_PATH,
-      "-",
     ];
 
-    if (MODEL) {
-      args.splice(1, 0, "--model", MODEL);
-    }
-
-    const childEnv = buildCodexChildEnv();
-
-    const child = spawn(CODEX_BIN, args, {
-      cwd: path.join(__dirname, ".."),
-      env: childEnv,
+    this.child = spawn(CODEX_BIN, args, {
+      cwd: APP_SERVER_CWD,
+      env: buildCodexChildEnv(),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      settled = true;
-      child.kill("SIGTERM");
-      reject(new Error(`Codex timed out after ${TIMEOUT_MS}ms.`));
-    }, TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk);
+    this.readline = readline.createInterface({ input: this.child.stdout });
+    this.readline.on("line", (line) => {
+      this.handleLine(line);
+    });
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr = appendLimited(this.stderr, chunk);
+    });
+    this.child.on("error", (error) => {
+      this.failAll(error);
+    });
+    this.child.on("close", (code) => {
+      this.closed = true;
+      this.failAll(new Error(compactCodexError(code, this.stderr, "")));
     });
 
-    child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk);
-    });
+    await this.request("initialize", {
+      clientInfo: {
+        name: "codex_context_translator",
+        title: "Codex Context Translator",
+        version: "0.2.0",
+      },
+      capabilities: {
+        experimentalApi: true,
+      },
+    }, APP_SERVER_REQUEST_TIMEOUT_MS);
+    this.notify("initialized", {});
+  }
 
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      if (!settled) {
-        settled = true;
+  async runPrompt(prompt) {
+    const threadStartedAt = Date.now();
+    const threadResult = await this.request("thread/start", {
+      approvalPolicy: "never",
+      baseInstructions: APP_SERVER_BASE_INSTRUCTIONS,
+      cwd: APP_SERVER_CWD,
+      developerInstructions: APP_SERVER_DEVELOPER_INSTRUCTIONS,
+      dynamicTools: [],
+      ephemeral: true,
+      model: MODEL || null,
+      multiAgentMode: "none",
+      sandbox: "read-only",
+    }, APP_SERVER_REQUEST_TIMEOUT_MS);
+    const threadStartMs = Date.now() - threadStartedAt;
+    const threadId = threadResult?.thread?.id;
+
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread id.");
+    }
+
+    const turnStartedAt = Date.now();
+    const turnResult = await this.request("turn/start", {
+      threadId,
+      approvalPolicy: "never",
+      cwd: APP_SERVER_CWD,
+      effort: normalizeEffort(EFFORT),
+      input: [{ type: "text", text: prompt }],
+      outputSchema: TRANSLATION_SCHEMA,
+    }, APP_SERVER_REQUEST_TIMEOUT_MS);
+    const turnStartMs = Date.now() - turnStartedAt;
+    const turnId = turnResult?.turn?.id;
+
+    if (!turnId) {
+      throw new Error("Codex app-server did not return a turn id.");
+    }
+
+    const turnWaitStartedAt = Date.now();
+    const output = await this.waitForTurn(threadId, turnId);
+    const turnWaitMs = Date.now() - turnWaitStartedAt;
+    const parseStartedAt = Date.now();
+    const result = parseJsonOutput(output);
+
+    return {
+      result,
+      timings: {
+        threadStartMs,
+        turnStartMs,
+        turnWaitMs,
+        parseMs: Date.now() - parseStartedAt,
+      },
+    };
+  }
+
+  request(method, params, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (this.closed || !this.child || !this.child.stdin.writable) {
+        reject(new Error("Codex app-server is not running."));
+        return;
+      }
+
+      const id = this.nextId;
+      this.nextId += 1;
+      const timeout = setTimeout(() => {
+        this.pending.delete(String(id));
+        reject(new Error(`Codex app-server ${method} timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+
+      this.pending.set(String(id), { method, resolve, reject, timeout });
+      try {
+        this.write({ id, method, params });
+      } catch (error) {
+        this.pending.delete(String(id));
+        clearTimeout(timeout);
         reject(error);
       }
     });
+  }
 
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      if (settled) {
-        return;
-      }
-      settled = true;
+  notify(method, params) {
+    this.write({ method, params });
+  }
 
-      if (code !== 0) {
-        reject(new Error(compactCodexError(code, stderr, stdout)));
-        return;
+  write(message) {
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  waitForTurn(threadId, turnId) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.turns.delete(turnId);
+        reject(new Error(`Codex timed out after ${TIMEOUT_MS}ms.`));
+      }, TIMEOUT_MS);
+
+      this.turns.set(turnId, {
+        threadId,
+        text: "",
+        finalText: "",
+        resolve,
+        reject,
+        timeout,
+      });
+    });
+  }
+
+  handleLine(line) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    let message;
+    try {
+      message = JSON.parse(trimmed);
+    } catch {
+      this.stderr = appendLimited(this.stderr, `${trimmed}\n`);
+      return;
+    }
+
+    if (message.id != null) {
+      this.handleResponse(message);
+      return;
+    }
+
+    if (typeof message.method === "string") {
+      this.handleNotification(message);
+    }
+  }
+
+  handleResponse(message) {
+    const pending = this.pending.get(String(message.id));
+    if (!pending) {
+      return;
+    }
+
+    this.pending.delete(String(message.id));
+    clearTimeout(pending.timeout);
+
+    if (message.error) {
+      pending.reject(new Error(formatJsonRpcError(pending.method, message.error)));
+      return;
+    }
+
+    pending.resolve(message.result);
+  }
+
+  handleNotification(message) {
+    const params = message.params || {};
+
+    if (message.method === "item/agentMessage/delta") {
+      const turn = this.turns.get(params.turnId);
+      if (turn) {
+        turn.text += params.delta || "";
       }
+      return;
+    }
+
+    if (message.method === "item/completed") {
+      const turn = this.turns.get(params.turnId);
+      const item = params.item;
+      if (turn && item?.type === "agentMessage" && typeof item.text === "string") {
+        if (item.phase === "final" || !turn.finalText) {
+          turn.finalText = item.text;
+        }
+      }
+      return;
+    }
+
+    if (message.method === "turn/completed") {
+      this.completeTurn(params);
+    }
+  }
+
+  completeTurn(params) {
+    const turnId = params.turn?.id;
+    const turn = this.turns.get(turnId);
+
+    if (!turn) {
+      return;
+    }
+
+    this.turns.delete(turnId);
+    clearTimeout(turn.timeout);
+
+    if (params.turn?.status !== "completed") {
+      turn.reject(new Error(params.turn?.error?.message || "Codex turn failed."));
+      return;
+    }
+
+    const finalText = getFinalAgentMessageText(params.turn) || turn.finalText || turn.text;
+
+    if (!finalText.trim()) {
+      turn.reject(new Error("Codex app-server returned an empty translation response."));
+      return;
+    }
+
+    turn.resolve(finalText);
+  }
+
+  failAll(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pending.clear();
+
+    for (const turn of this.turns.values()) {
+      clearTimeout(turn.timeout);
+      turn.reject(error);
+    }
+    this.turns.clear();
+  }
+
+  async shutdown() {
+    this.closed = true;
+
+    if (this.readline) {
+      this.readline.close();
+    }
+
+    if (!this.child) {
+      return;
+    }
+
+    const child = this.child;
+    this.child = null;
+
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, 1000);
+
+      child.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
 
       try {
-        resolve(parseJsonOutput(stdout));
-      } catch (error) {
-        reject(
-          new Error(
-            `Codex returned non-JSON output. ${error instanceof Error ? error.message : String(error)}`,
-          ),
-        );
+        child.stdin.end();
+        child.kill("SIGTERM");
+      } catch {
+        clearTimeout(timeout);
+        resolve();
       }
     });
-
-    child.stdin.end(prompt);
-  });
+  }
 }
 
 function buildCodexChildEnv() {
@@ -541,14 +1072,7 @@ function parseRetryDelays(value) {
 function isRetryableCodexError(error) {
   const message = getErrorMessage(error).toLowerCase();
 
-  if (
-    message.includes("not logged in") ||
-    message.includes("log in") ||
-    message.includes("unauthorized") ||
-    message.includes("authentication") ||
-    message.includes("forbidden") ||
-    message.includes("invalid api key")
-  ) {
+  if (isAuthenticationErrorMessage(message)) {
     return false;
   }
 
@@ -571,6 +1095,17 @@ function isRetryableCodexError(error) {
     "too many requests",
     "rate limit",
   ].some((term) => message.includes(term));
+}
+
+function isAuthenticationErrorMessage(message) {
+  return (
+    message.includes("not logged in") ||
+    message.includes("log in") ||
+    message.includes("unauthorized") ||
+    message.includes("authentication") ||
+    message.includes("forbidden") ||
+    message.includes("invalid api key")
+  );
 }
 
 function wait(delayMs) {
@@ -613,6 +1148,21 @@ function compactCodexError(code, stderr, stdout) {
     : `Codex exited with code ${code}.`;
 }
 
+function formatJsonRpcError(method, error) {
+  const message = typeof error?.message === "string" ? error.message : "Unknown error.";
+  const code = error?.code == null ? "" : ` ${error.code}`;
+  return `Codex app-server ${method} failed${code}: ${message}`;
+}
+
+function getFinalAgentMessageText(turn) {
+  const agentMessages = Array.isArray(turn?.items)
+    ? turn.items.filter((item) => item?.type === "agentMessage" && typeof item.text === "string")
+    : [];
+  const finalMessage = agentMessages.findLast((item) => item.phase === "final");
+  const fallbackMessage = agentMessages.at(-1);
+  return finalMessage?.text || fallbackMessage?.text || "";
+}
+
 function parseJsonOutput(output) {
   const trimmed = output.trim();
 
@@ -635,6 +1185,83 @@ function stripCodeFence(value) {
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
+}
+
+function summarizeRunTimings(runTimings, baseTimings) {
+  const timings = {
+    ...baseTimings,
+    runs: runTimings.map(compactRunTiming),
+  };
+
+  for (const runTiming of runTimings) {
+    mergeTimingValuesInto(timings, runTiming);
+  }
+
+  return timings;
+}
+
+function compactRunTiming(timing) {
+  return {
+    index: timing.index,
+    mode: timing.mode,
+    targetCount: timing.targetCount,
+    targetChars: timing.targetChars,
+    promptBuildMs: timing.promptBuildMs,
+    appServerStartMs: timing.appServerStartMs,
+    threadStartMs: timing.threadStartMs,
+    turnStartMs: timing.turnStartMs,
+    turnWaitMs: timing.turnWaitMs,
+    parseMs: timing.parseMs,
+    validationMs: timing.validationMs,
+    codexTotalMs: timing.codexTotalMs,
+    codexAttempts: timing.codexAttempts,
+    codexRetries: timing.codexRetries,
+    retryDelayMs: timing.retryDelayMs,
+  };
+}
+
+function mergeTimingValues(current, next) {
+  const timings = { ...(current || {}) };
+  mergeTimingValuesInto(timings, next);
+  return timings;
+}
+
+function mergeTimingValuesInto(current, next) {
+  if (!next || typeof next !== "object") {
+    return current;
+  }
+
+  const sumFields = [
+    "promptBuildMs",
+    "appServerStartMs",
+    "threadStartMs",
+    "turnStartMs",
+    "turnWaitMs",
+    "parseMs",
+    "validationMs",
+    "codexTotalMs",
+    "retryDelayMs",
+    "codexAttempts",
+    "codexRetries",
+    "targetCount",
+    "targetChars",
+  ];
+
+  for (const field of sumFields) {
+    const value = readNonNegativeNumber(next[field]);
+    if (value === null) {
+      continue;
+    }
+
+    current[field] = (readNonNegativeNumber(current[field]) || 0) + value;
+
+    if (field.endsWith("Ms")) {
+      const maxField = field.replace(/Ms$/, "MaxMs");
+      current[maxField] = Math.max(readNonNegativeNumber(current[maxField]) || 0, value);
+    }
+  }
+
+  return current;
 }
 
 function estimateUsage(prompt, translations) {
@@ -723,6 +1350,10 @@ function sumOptionalNumbers(left, right) {
   return safeLeft || safeRight ? safeLeft + safeRight : null;
 }
 
+function readNonNegativeNumber(value) {
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function normalizeTranslations(result, requestedParagraphs) {
   if (!result || !Array.isArray(result.translations)) {
     throw new Error("Codex output did not include translations.");
@@ -753,5 +1384,6 @@ function normalizeTranslations(result, requestedParagraphs) {
 
 module.exports = {
   getBridgeInfo,
+  shutdownTranslator,
   translatePayload,
 };
