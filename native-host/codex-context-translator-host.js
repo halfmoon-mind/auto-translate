@@ -68,7 +68,16 @@ async function handleMessage(message) {
   }
 
   if (message?.type === "translate") {
-    const result = await translatePayload(message.payload);
+    const onPartial = message.requestId == null
+      ? null
+      : (translation) => {
+          writeMessage({
+            requestId: message.requestId,
+            partial: true,
+            translations: [translation],
+          });
+        };
+    const result = await translatePayload(message.payload, onPartial);
     return {
       ok: true,
       translations: result.translations,
