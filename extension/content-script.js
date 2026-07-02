@@ -871,11 +871,22 @@
     const retryCount = (options.qualityRetryCount || 0) + 1;
 
     if (retryCount > MAX_SINGLE_ITEM_QUALITY_RETRIES) {
+      let translated = 0;
+      let failedCount = 0;
+
       for (const failed of result.failedItems) {
+        if (failed.text && isFormatMarkerOnlyFailure(failed.item, failed.text)) {
+          translated += applyTranslations([failed.item], [{ id: failed.item.id, text: failed.text }]);
+          logTranslationQualityFailure(failed.error, [failed.item], "applied_degraded_formatting", options.qualityRetryCount || 0);
+          continue;
+        }
+
+        failedCount += 1;
+        options.progress.firstError ||= getErrorMessage(failed.error);
         logTranslationQualityFailure(failed.error, [failed.item], "failed", options.qualityRetryCount || 0);
       }
-      options.progress.firstError ||= getErrorMessage(result.failedItems[0].error);
-      recordTranslationProgress(options, 0, result.failedItems.length);
+
+      recordTranslationProgress(options, translated, failedCount);
       return;
     }
 
@@ -997,7 +1008,7 @@
       try {
         validateTranslationQuality(item, translatedText);
       } catch (error) {
-        failedItems.push({ item, error });
+        failedItems.push({ item, error, text: translatedText });
         continue;
       }
 
@@ -1469,6 +1480,19 @@
 
     if (missingNumbers.length > 0) {
       throw createMissingNumbersQualityError(item, sourceText, targetText, missingNumbers);
+    }
+  }
+
+  // A translation whose only defect is mangled [[CTX-FMT-*]] markers is still
+  // worth applying after the quality retry runs out: the fragment builder
+  // tolerates broken format pairs, so the worst case is lost bold/italic on
+  // one span. Links, preserved nodes, URLs, and numbers stay strict.
+  function isFormatMarkerOnlyFailure(item, translatedText) {
+    try {
+      validateTranslationQuality({ ...item, formatNodes: [] }, stripFormatMarkers(translatedText));
+      return true;
+    } catch {
+      return false;
     }
   }
 

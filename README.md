@@ -137,5 +137,6 @@ The native bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child pr
 
 - The extension sends one translation request per page translation. The local native host splits the page into char-balanced batches and runs up to 4 in parallel; translated paragraphs stream back and appear in the page as each one completes.
 - If individual paragraphs fail client-side validation (missing numbers, markers, or URLs), only those paragraphs are retried once with a hint; the rest of the page keeps its translations.
+- If the retry still fails and the only defect is broken inline-format markers (`[[CTX-FMT-*]]`, bold/italic), the translation is applied anyway with degraded formatting instead of leaving the paragraph untranslated. Link, preserve, URL, and number checks stay strict (`scripts/test-quality-validation.js` covers the decision).
 - Large pages can still consume Codex usage quickly because the page text is sent as translation input. Token usage shown in the popup is the real count reported by `codex app-server`.
 - The extension replaces paragraph text in the page. Use `원문 복원` before re-translating.
