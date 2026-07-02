@@ -1,10 +1,12 @@
 const NATIVE_HOST = "com.codex_context_translator.host";
-const NATIVE_SESSION_IDLE_TIMEOUT_MS = 30000;
+// Keep the session (and its warm codex app-server) alive between page
+// translations; consecutive translations skip the 1-3s cold start.
+const NATIVE_SESSION_IDLE_TIMEOUT_MS = 300000;
 
 const nativeSessions = new Map();
 let nextNativeRequestId = 1;
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "CODEX_LOCAL_HEALTH") {
     handleHealth().then(sendResponse).catch((error) => {
       sendResponse(toErrorResponse(error));
@@ -19,15 +21,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === "CODEX_LOCAL_TRANSLATION_SESSION_END") {
-    handleTranslationSessionEnd(message.sessionId).then(sendResponse).catch((error) => {
-      sendResponse(toErrorResponse(error));
-    });
-    return true;
-  }
-
   if (message?.type === "CODEX_LOCAL_TRANSLATE") {
-    handleTranslate(message.payload, message.sessionId).then(sendResponse).catch((error) => {
+    handleTranslate(message.payload, message.sessionId, sender?.tab?.id).then(sendResponse).catch((error) => {
       sendResponse(toErrorResponse(error));
     });
     return true;
@@ -56,6 +51,28 @@ async function handleHealth() {
 }
 
 async function handleTranslationSessionStart() {
+  // Reuse an already-open session so the warm codex app-server is kept.
+  for (const existing of nativeSessions.values()) {
+    if (existing.closed) {
+      continue;
+    }
+
+    try {
+      const data = await sendNativeSessionMessage(existing, { type: "health" });
+      if (data?.ok) {
+        return {
+          ...data,
+          ok: true,
+          sessionId: existing.id,
+          source: "native",
+        };
+      }
+    } catch {
+      // Dead session; fall through to open a fresh one.
+    }
+    break;
+  }
+
   const session = openNativeSession();
 
   try {
@@ -80,31 +97,18 @@ async function handleTranslationSessionStart() {
   }
 }
 
-async function handleTranslationSessionEnd(sessionId) {
-  const session = getNativeSession(sessionId);
-
-  if (session) {
-    closeNativeSession(session);
-  }
-
-  return { ok: true };
-}
-
-async function handleTranslate(payload, sessionId) {
+async function handleTranslate(payload, sessionId, tabId) {
   if (sessionId) {
     const session = getNativeSession(sessionId);
 
     if (!session) {
-      throw createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_host_unreachable");
+      throw createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_session_expired");
     }
 
-    const data = await sendNativeSessionMessage(session, { type: "translate", payload });
+    const data = await sendNativeSessionMessage(session, { type: "translate", payload }, tabId);
 
     if (!data?.ok) {
-      throw createSetupError(
-        data?.error || "Native host translation failed.",
-        data?.setupCode || "native_host_unreachable",
-      );
+      throw createTranslateError(data);
     }
 
     return {
@@ -116,16 +120,23 @@ async function handleTranslate(payload, sessionId) {
   const data = await sendNativeHostMessage({ type: "translate", payload });
 
   if (!data?.ok) {
-    throw createSetupError(
-      data?.error || "Native host translation failed.",
-      data?.setupCode || "native_host_unreachable",
-    );
+    throw createTranslateError(data);
   }
 
   return {
     ...data,
     source: "native",
   };
+}
+
+// Server-side run failures (turn timeout, bad output) carry no setupCode on
+// purpose: only genuine bridge/setup failures should skip the split retry.
+function createTranslateError(data) {
+  const error = new Error(data?.error || "Native host translation failed.");
+  if (typeof data?.setupCode === "string" && data.setupCode) {
+    error.setupCode = data.setupCode;
+  }
+  return error;
 }
 
 function openNativeSession() {
@@ -181,17 +192,17 @@ function closeNativeSession(session, reason) {
   }
 }
 
-function sendNativeSessionMessage(session, message) {
+function sendNativeSessionMessage(session, message, tabId) {
   return new Promise((resolve, reject) => {
     if (session.closed) {
-      reject(createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_host_unreachable"));
+      reject(createSetupError("번역 세션이 종료되었습니다. 다시 시도하세요.", "native_session_expired"));
       return;
     }
 
     const requestId = String(nextNativeRequestId);
     nextNativeRequestId += 1;
 
-    session.pending.set(requestId, { resolve, reject });
+    session.pending.set(requestId, { resolve, reject, tabId });
     clearNativeSessionIdleTimer(session);
 
     try {
@@ -211,6 +222,20 @@ function handleNativeSessionMessage(session, message) {
   const pending = session.pending.get(requestId);
 
   if (!pending) {
+    return;
+  }
+
+  if (message.partial) {
+    // Streamed per-paragraph translation; forward to the tab, keep waiting.
+    if (pending.tabId != null) {
+      chrome.tabs.sendMessage(
+        pending.tabId,
+        { type: "CODEX_TRANSLATE_PARTIAL", translations: message.translations || [] },
+        () => {
+          void chrome.runtime.lastError;
+        },
+      );
+    }
     return;
   }
 
@@ -314,11 +339,16 @@ function createSetupError(message, setupCode) {
 }
 
 function toErrorResponse(error) {
-  return {
+  const response = {
     ok: false,
     error: getErrorMessage(error),
-    setupCode: error?.setupCode || "native_host_unreachable",
   };
+
+  if (typeof error?.setupCode === "string" && error.setupCode) {
+    response.setupCode = error.setupCode;
+  }
+
+  return response;
 }
 
 function getErrorMessage(error) {

@@ -160,8 +160,10 @@
   const ANY_LINK_MARKER_PATTERN = /\[\[\/?CTX-LINK-\d+\]\]/g;
   const ANY_PRESERVE_MARKER_PATTERN = /\[\[\/?CTX-PRESERVE-\d+\]\]/g;
   const ANY_FORMAT_MARKER_PATTERN = /\[\[\/?CTX-FMT-\d+\]\]/g;
-  const MAX_CONTEXT_ITEMS = 12;
-  const MAX_CONTEXT_SNIPPET_CHARS = 120;
+  const MAX_CONTEXT_ITEMS = 4;
+  const MAX_CONTEXT_SNIPPET_CHARS = 100;
+  // Must match MAX_ITEM_CHARS in server/translator.js.
+  const MAX_ITEM_CHARS = 12000;
   const ESTIMATE_MAX_PARAGRAPHS_PER_RUN = 18;
   const ESTIMATE_MAX_TARGET_CHARS_PER_RUN = 6000;
   const PRIORITY_BATCH_MAX_PARAGRAPHS = 8;
@@ -178,6 +180,8 @@
     originals: new Map(),
     translationCache: new Map(),
     inflightTranslations: new Map(),
+    activeItems: null,
+    partialApplied: new Set(),
   };
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -201,6 +205,11 @@
     if (message?.type === "CODEX_RESTORE_PAGE") {
       const restored = restoreOriginals();
       sendResponse({ ok: true, restored });
+      return false;
+    }
+
+    if (message?.type === "CODEX_TRANSLATE_PARTIAL") {
+      applyPartialTranslations(message.translations || []);
       return false;
     }
 
@@ -235,6 +244,8 @@
       metrics = estimateTranslationWork(items, batches);
       const context = buildContext(items);
       const page = getPageInfo();
+      state.activeItems = new Map(prioritizedItems.map((item) => [item.id, item]));
+      state.partialApplied = new Set();
       publishStatus("translating", `${items.length}개 단락을 자동 번역 중입니다.`, 0, items.length, {
         startedAt,
         metrics,
@@ -291,15 +302,11 @@
       });
       throw error;
     } finally {
-      if (sessionId) {
-        try {
-          await endTranslationSession(sessionId);
-        } catch (error) {
-          console.warn("Codex translation session cleanup failed.", getSafeErrorLogDetails(error));
-        }
-      }
+      // The session stays open on purpose: the background keeps it (and the
+      // warm codex app-server) alive for the next translation.
       state.inProgress = false;
       state.inflightTranslations.clear();
+      state.activeItems = null;
     }
   }
 
@@ -345,6 +352,11 @@
       if (isPreserveOnlyText(serialized.text)) {
         continue;
       }
+      // ponytail: oversize single blocks stay untranslated; split at sentence
+      // boundaries if this ever matters in practice.
+      if (serialized.text.length > MAX_ITEM_CHARS) {
+        continue;
+      }
 
       seen.add(element);
       const id = getOrCreateElementId(element, items.length + 1);
@@ -356,6 +368,7 @@
         links: serialized.links,
         preservedNodes: serialized.preservedNodes,
         formatNodes: serialized.formatNodes,
+        fullWrapLink: serialized.fullWrapLink,
       });
     }
 
@@ -461,7 +474,7 @@
     ].join(",");
 
     if (!element.querySelector(inlineSelector)) {
-      return { text: fallbackText, links, preservedNodes, formatNodes };
+      return { text: fallbackText, links, preservedNodes, formatNodes, fullWrapLink: null };
     }
 
     const text = normalizeText(
@@ -471,10 +484,36 @@
     );
 
     return {
-      text: text || fallbackText,
-      links,
+      ...unwrapFullLink(text || fallbackText, links),
       preservedNodes,
       formatNodes,
+    };
+  }
+
+  // A target that is one single link wrapping the whole text (nav items, list
+  // links) tempts the model into dropping the wrapper markers. Send the bare
+  // label instead and re-wrap with the remembered link element on apply.
+  function unwrapFullLink(text, links) {
+    if (links.length !== 1) {
+      return { text, links, fullWrapLink: null };
+    }
+
+    const openMarker = `[[${links[0].token}]]`;
+    const closeMarker = `[[/${links[0].token}]]`;
+
+    if (
+      !text.startsWith(openMarker) ||
+      !text.endsWith(closeMarker) ||
+      countOccurrences(text, openMarker) !== 1 ||
+      countOccurrences(text, closeMarker) !== 1
+    ) {
+      return { text, links, fullWrapLink: null };
+    }
+
+    return {
+      text: text.slice(openMarker.length, text.length - closeMarker.length).trim(),
+      links: [],
+      fullWrapLink: links[0].element,
     };
   }
 
@@ -624,22 +663,10 @@
   }
 
   function buildContext(items) {
-    const context = [];
-    const title = normalizeText(document.title || "");
-    const description = getMetaDescription();
-
-    if (title) {
-      context.push(`Title: ${title}`);
-    }
-    if (description) {
-      context.push(`Description: ${description}`);
-    }
-
-    for (const item of items.slice(0, MAX_CONTEXT_ITEMS)) {
-      context.push(`${item.kind}: ${item.text.slice(0, MAX_CONTEXT_SNIPPET_CHARS)}`);
-    }
-
-    return context;
+    // Title and description already travel in the payload's page object.
+    return items
+      .slice(0, MAX_CONTEXT_ITEMS)
+      .map((item) => `${item.kind}: ${item.text.slice(0, MAX_CONTEXT_SNIPPET_CHARS)}`);
   }
 
   function prioritizeItems(items) {
@@ -766,8 +793,6 @@
       batch: orderedBatch,
       page,
       context,
-      index: 0,
-      totalBatches: 1,
       startedAt,
       metrics,
       totalItems,
@@ -803,16 +828,13 @@
 
   async function translateBatchWithRetry(options) {
     const { batch, depth } = options;
+    let result;
 
     try {
-      const result = await requestTranslationBatch(options);
-      addUsage(options.progress, result.usage);
-      addTimings(options.progress, result.timings);
-      const translations = result.translations;
-      const translated = applyTranslations(batch, translations);
-      recordTranslationProgress(options, translated, batch.length - translated);
-      return;
+      result = await requestTranslationBatch(options);
     } catch (error) {
+      // Whole-request failure (bridge/server); per-item quality failures are
+      // returned in result.failedItems instead of thrown.
       if (batch.length > 1 && depth < MAX_RETRY_SPLIT_DEPTH && shouldSplitRetry(error)) {
         const midpoint = Math.ceil(batch.length / 2);
         await Promise.all([
@@ -830,34 +852,47 @@
         return;
       }
 
-      if (
-        batch.length === 1 &&
-        isQualityValidationError(error) &&
-        (options.qualityRetryCount || 0) < MAX_SINGLE_ITEM_QUALITY_RETRIES
-      ) {
-        const retryCount = (options.qualityRetryCount || 0) + 1;
-
-        logTranslationQualityFailure(error, batch, "retrying_single_item", retryCount);
-        await translateBatchWithRetry({
-          ...options,
-          qualityRetry: createQualityRetryHint(error),
-          qualityRetryCount: retryCount,
-        });
-        return;
-      }
-
-      if (isQualityValidationError(error)) {
-        logTranslationQualityFailure(error, batch, "failed", options.qualityRetryCount || 0);
-        console.warn("Codex translation batch failed.", getErrorMessage(error));
-      } else {
-        console.warn("Codex translation batch failed.", getSafeErrorLogDetails(error));
-      }
+      console.warn("Codex translation batch failed.", getSafeErrorLogDetails(error));
       options.progress.firstError ||= getErrorMessage(error);
       recordTranslationProgress(options, 0, batch.length);
+      return;
     }
+
+    addUsage(options.progress, result.usage);
+    addTimings(options.progress, result.timings);
+    const translated = applyTranslations(batch, result.translations);
+    recordTranslationProgress(options, translated, 0);
+
+    if (result.failedItems.length === 0) {
+      return;
+    }
+
+    // Retry only the items that actually failed validation, one hint each.
+    const retryCount = (options.qualityRetryCount || 0) + 1;
+
+    if (retryCount > MAX_SINGLE_ITEM_QUALITY_RETRIES) {
+      for (const failed of result.failedItems) {
+        logTranslationQualityFailure(failed.error, [failed.item], "failed", options.qualityRetryCount || 0);
+      }
+      options.progress.firstError ||= getErrorMessage(result.failedItems[0].error);
+      recordTranslationProgress(options, 0, result.failedItems.length);
+      return;
+    }
+
+    await Promise.all(
+      result.failedItems.map((failed) => {
+        logTranslationQualityFailure(failed.error, [failed.item], "retrying_single_item", retryCount);
+        return translateBatchWithRetry({
+          ...options,
+          batch: [failed.item],
+          qualityRetry: createQualityRetryHint(failed.error),
+          qualityRetryCount: retryCount,
+        });
+      }),
+    );
   }
 
-  async function requestTranslationBatch({ batch, page, context, index, totalBatches, sessionId, qualityRetry }) {
+  async function requestTranslationBatch({ batch, page, context, sessionId, qualityRetry }) {
     const cachedById = new Map();
     const uncachedItems = [];
     const pendingItems = [];
@@ -883,6 +918,7 @@
 
     const uniqueItems = getUniqueTranslationItems(uncachedItems);
     const fetchedByKey = new Map();
+    const failedByKey = new Map();
     const pendingByCacheKey = new Map();
     let usage = null;
     let timings = null;
@@ -901,8 +937,6 @@
           items: uniqueItems,
           page,
           context,
-          index,
-          totalBatches,
           sessionId,
           qualityRetry,
         });
@@ -914,8 +948,14 @@
           const sourceKey = getTranslationSourceKey(item);
           const cacheKey = getTranslationCacheKey(page, item);
 
-          fetchedByKey.set(sourceKey, translatedText);
-          pendingByCacheKey.get(cacheKey)?.resolve(translatedText);
+          if (translatedText) {
+            fetchedByKey.set(sourceKey, translatedText);
+            pendingByCacheKey.get(cacheKey)?.resolve(translatedText);
+          } else {
+            const error = new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
+            failedByKey.set(sourceKey, error);
+            pendingByCacheKey.get(cacheKey)?.reject(error);
+          }
         }
       } catch (error) {
         for (const deferred of pendingByCacheKey.values()) {
@@ -930,31 +970,47 @@
     }
 
     for (const { item, promise } of pendingItems) {
-      fetchedByKey.set(getTranslationSourceKey(item), await promise);
+      try {
+        fetchedByKey.set(getTranslationSourceKey(item), await promise);
+      } catch (error) {
+        failedByKey.set(getTranslationSourceKey(item), error);
+      }
     }
 
     const translations = [];
+    const failedItems = [];
 
     for (const item of batch) {
       const sourceKey = getTranslationSourceKey(item);
-      const translatedText =
-        cachedById.get(item.id) || fetchedByKey.get(sourceKey);
+      const translatedText = cachedById.get(item.id) || fetchedByKey.get(sourceKey);
 
       if (!translatedText) {
-        throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
+        failedItems.push({
+          item,
+          error:
+            failedByKey.get(sourceKey) ||
+            new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`),
+        });
+        continue;
       }
 
-      validateTranslationQuality(item, translatedText);
+      try {
+        validateTranslationQuality(item, translatedText);
+      } catch (error) {
+        failedItems.push({ item, error });
+        continue;
+      }
+
       if (fetchedByKey.has(sourceKey)) {
         cacheTranslation(page, item, translatedText);
       }
       translations.push({ id: item.id, text: translatedText });
     }
 
-    return { translations, usage, timings };
+    return { translations, failedItems, usage, timings };
   }
 
-  async function fetchTranslations({ items, page, context, index, totalBatches, sessionId, qualityRetry }) {
+  async function fetchTranslations({ items, page, context, sessionId, qualityRetry }) {
     const startedAt = Date.now();
     const response = await sendRuntimeMessage({
       type: "CODEX_LOCAL_TRANSLATE",
@@ -962,10 +1018,6 @@
       payload: {
         page,
         context,
-        batch: {
-          index: index + 1,
-          total: totalBatches,
-        },
         paragraphs: items.map((item) => ({
           id: item.id,
           kind: item.kind,
@@ -976,11 +1028,15 @@
     });
 
     if (!response?.ok) {
-      throw new Error(response?.error || "로컬 번역 브리지 오류입니다.");
+      const error = new Error(response?.error || "로컬 번역 브리지 오류입니다.");
+      if (typeof response?.setupCode === "string" && response.setupCode) {
+        error.setupCode = response.setupCode;
+      }
+      throw error;
     }
 
     return {
-      translations: normalizeTranslationResponse(items, response.translations || []),
+      translations: normalizeTranslationResponse(response.translations || []),
       usage: response.usage || null,
       timings: {
         ...(response.timings || {}),
@@ -1004,14 +1060,41 @@
     };
   }
 
-  async function endTranslationSession(sessionId) {
-    const response = await sendRuntimeMessage({
-      type: "CODEX_LOCAL_TRANSLATION_SESSION_END",
-      sessionId,
-    });
+  // Streamed per-paragraph translations arriving ahead of the final response.
+  function applyPartialTranslations(translations) {
+    if (!state.inProgress || !state.activeItems) {
+      return;
+    }
 
-    if (!response?.ok) {
-      throw new Error(response?.error || "로컬 번역 세션을 종료하지 못했습니다.");
+    for (const translation of translations) {
+      const item = state.activeItems.get(translation?.id);
+      const text = typeof translation?.text === "string" ? translation.text.trim() : "";
+
+      if (!item || !text || state.partialApplied.has(item.id)) {
+        continue;
+      }
+
+      try {
+        validateTranslationQuality(item, text);
+      } catch {
+        continue; // The final response path retries this item with a hint.
+      }
+
+      applyTranslations([item], [{ id: item.id, text }]);
+      state.partialApplied.add(item.id);
+    }
+
+    if (state.partialApplied.size > 0 && state.lastStatus?.phase === "translating") {
+      publishStatus(
+        "translating",
+        `${state.partialApplied.size}개 단락을 번역했습니다…`,
+        state.partialApplied.size,
+        state.activeItems.size,
+        {
+          startedAt: state.lastStatus.startedAt,
+          metrics: state.lastStatus.metrics,
+        },
+      );
     }
   }
 
@@ -1055,12 +1138,11 @@
       "codexRetries",
       "targetCount",
       "targetChars",
-      "oneShotMs",
-      "oneShotEstimatedTokens",
+      "missingCount",
     ];
     const maxFields = ["serverParallelRuns"];
-    const stringFields = ["mode", "oneShotReason", "oneShotFailure"];
-    const booleanFields = ["oneShotEligible", "oneShotFallback"];
+    const stringFields = ["mode"];
+    const booleanFields = [];
 
     for (const field of sumFields) {
       const value = readOptionalNumber(next[field]);
@@ -1197,6 +1279,7 @@
 
     return {
       inputTokens: current.inputTokens + next.inputTokens,
+      cachedInputTokens: (current.cachedInputTokens || 0) + (next.cachedInputTokens || 0),
       outputTokens: current.outputTokens + next.outputTokens,
       totalTokens: current.totalTokens + next.totalTokens,
       costUsd: sumOptionalNumbers(current.costUsd, next.costUsd),
@@ -1220,6 +1303,7 @@
 
     return {
       inputTokens,
+      cachedInputTokens: readTokenCount(usage.cachedInputTokens),
       outputTokens,
       totalTokens: totalTokens || inputTokens + outputTokens,
       costUsd: readOptionalNumber(usage.costUsd),
@@ -1244,7 +1328,7 @@
     return safeLeft || safeRight ? safeLeft + safeRight : null;
   }
 
-  function normalizeTranslationResponse(items, translations) {
+  function normalizeTranslationResponse(translations) {
     const byId = new Map();
 
     for (const translation of translations) {
@@ -1258,16 +1342,6 @@
       if (id && text) {
         byId.set(id, text);
       }
-    }
-
-    for (const item of items) {
-      const translatedText = byId.get(item.id);
-
-      if (!translatedText) {
-        throw new Error(`${QUALITY_ERROR_PREFIX}: ${item.id} 번역이 누락되었습니다.`);
-      }
-
-      validateTranslationQuality(item, translatedText);
     }
 
     return byId;
@@ -1618,6 +1692,12 @@
   }
 
   function shouldSplitRetry(error) {
+    // Infrastructure failures carry a setupCode; splitting the batch and
+    // retrying against a dead bridge only multiplies the failure.
+    if (typeof error?.setupCode === "string" && error.setupCode) {
+      return false;
+    }
+
     const message = getErrorMessage(error).toLowerCase();
     return (
       !message.includes("failed to fetch") &&
@@ -1695,6 +1775,14 @@
       item.preservedNodes || [],
       item.formatNodes || [],
     );
+    const content = fragment || document.createTextNode(stripInlineMarkers(translatedText));
+
+    if (item.fullWrapLink) {
+      const linkClone = item.fullWrapLink.cloneNode(false);
+      linkClone.append(content);
+      item.element.replaceChildren(linkClone);
+      return;
+    }
 
     if (fragment) {
       item.element.replaceChildren(fragment);

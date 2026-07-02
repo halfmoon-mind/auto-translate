@@ -344,15 +344,10 @@ function formatTimings(timings) {
   }
 
   const parts = [];
-  const mode = formatTimingMode(timings.mode);
-  if (mode) {
-    parts.push(mode);
-  }
   addTimingPart(parts, "수집", timings.collectMs);
   addTimingPart(parts, "세션", timings.sessionStartMs);
   addTimingPart(parts, "브리지", timings.nativeRoundTripMaxMs || timings.nativeRoundTripMs);
   addTimingPart(parts, "로컬", timings.serverTotalMaxMs || timings.serverTotalMs);
-  addTimingPart(parts, "원샷", timings.oneShotMs);
   addTimingPart(parts, "thread", timings.threadStartMaxMs || timings.threadStartMs);
   addTimingPart(parts, "turn", timings.turnWaitMaxMs || timings.turnWaitMs);
   addTimingPart(parts, "검증", timings.validationMaxMs || timings.validationMs);
@@ -363,20 +358,6 @@ function formatTimings(timings) {
   }
 
   return parts.length > 0 ? `계측 ${parts.join(" / ")}` : "";
-}
-
-function formatTimingMode(mode) {
-  if (mode === "one_shot") {
-    return "원샷";
-  }
-  if (mode === "split_after_one_shot") {
-    return "원샷 후 분해";
-  }
-  if (mode === "split") {
-    return "분해";
-  }
-
-  return "";
 }
 
 function addTimingPart(parts, label, value) {
@@ -425,7 +406,9 @@ function formatUsageTokens(usage) {
     return total;
   }
 
-  return `입력 ${formatTokenCount(usage.inputTokens)} / 출력 ${formatTokenCount(usage.outputTokens)} / 합계 ${total}`;
+  const cached = readTokenCount(usage.cachedInputTokens);
+  const cachedPart = cached ? ` (캐시 ${formatTokenCount(cached)})` : "";
+  return `입력 ${formatTokenCount(usage.inputTokens)}${cachedPart} / 출력 ${formatTokenCount(usage.outputTokens)} / 합계 ${total}`;
 }
 
 function readTokenCount(value) {
