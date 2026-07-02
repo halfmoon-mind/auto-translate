@@ -55,11 +55,14 @@ async function testHealthAndTranslate(fakeCodexPath) {
     CODEX_TRANSLATOR_CODEX_BIN: fakeCodexPath,
   });
 
-  assert.equal(responses.length, 2);
-  assert.deepEqual(responses.map((response) => response.requestId).sort(), ["one", "two"]);
+  const finals = responses.filter((response) => !response.partial);
+  const partials = responses.filter((response) => response.partial);
 
-  const health = responses.find((response) => response.requestId === "one");
-  const translate = responses.find((response) => response.requestId === "two");
+  assert.equal(finals.length, 2);
+  assert.deepEqual(finals.map((response) => response.requestId).sort(), ["one", "two"]);
+
+  const health = finals.find((response) => response.requestId === "one");
+  const translate = finals.find((response) => response.requestId === "two");
 
   assert.equal(health.ok, true);
   assert.equal(health.source, "native");
@@ -69,10 +72,21 @@ async function testHealthAndTranslate(fakeCodexPath) {
   assert.equal(translate.ok, true);
   assert.equal(translate.source, "native");
   assert.deepEqual(translate.translations, [{ id: "p1", text: "ko:Hello world." }]);
-  assert.equal(typeof translate.usage.inputTokens, "number");
-  assert.equal(typeof translate.usage.outputTokens, "number");
+
+  // Streamed partial frames arrive before the final response, remapped to
+  // the caller's paragraph ids.
+  assert.ok(partials.length >= 1, "expected at least one partial frame");
+  assert.equal(partials[0].requestId, "two");
+  assert.deepEqual(partials[0].translations, [{ id: "p1", text: "ko:Hello world." }]);
+
+  // Real usage from the fake thread/tokenUsage/updated notification.
+  assert.equal(translate.usage.estimated, false);
+  assert.equal(translate.usage.inputTokens, 100);
+  assert.equal(translate.usage.cachedInputTokens, 10);
+  assert.equal(translate.usage.outputTokens, 50);
+  assert.equal(translate.usage.totalTokens, 150);
   assert.equal(translate.usage.costBasis.source, "https://developers.openai.com/api/docs/pricing");
-  assert.equal(translate.timings.mode, "one_shot");
+  assert.equal(translate.timings.mode, "split");
   assert.equal(translate.timings.serverBatchCount, 1);
   assert.equal(typeof translate.timings.threadStartMs, "number");
   assert.equal(typeof translate.timings.turnWaitMs, "number");
@@ -247,6 +261,39 @@ rl.on("line", (line) => {
       text,
     };
 
+    // Stream the output as deltas so the incremental scanner is exercised.
+    const midpoint = Math.ceil(text.length / 2);
+    send({
+      method: "item/agentMessage/delta",
+      params: { turnId, delta: text.slice(0, midpoint) },
+    });
+    send({
+      method: "item/agentMessage/delta",
+      params: { turnId, delta: text.slice(midpoint) },
+    });
+    send({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-" + (nextThreadId - 1),
+        turnId,
+        tokenUsage: {
+          last: {
+            inputTokens: 100,
+            cachedInputTokens: 10,
+            outputTokens: 50,
+            reasoningOutputTokens: 0,
+            totalTokens: 150,
+          },
+          total: {
+            inputTokens: 100,
+            cachedInputTokens: 10,
+            outputTokens: 50,
+            reasoningOutputTokens: 0,
+            totalTokens: 150,
+          },
+        },
+      },
+    });
     send({
       method: "item/completed",
       params: {

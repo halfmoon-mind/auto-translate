@@ -116,7 +116,6 @@ begin_step "필수 runtime 파일 확인"
 REQUIRED_FILES=(
   "$HOST_SCRIPT"
   "$SERVER_DIR/translator.js"
-  "$SERVER_DIR/translation-schema.json"
   "$SERVER_DIR/openai-pricing-snapshot.json"
 )
 
@@ -153,8 +152,8 @@ finish_step
 begin_step "runtime 파일 복사"
 install -m 755 "$HOST_SCRIPT" "$APP_HOST_SCRIPT"
 install -m 644 "$SERVER_DIR/translator.js" "$APP_SERVER_DIR/translator.js"
-install -m 644 "$SERVER_DIR/translation-schema.json" "$APP_SERVER_DIR/translation-schema.json"
 install -m 644 "$SERVER_DIR/openai-pricing-snapshot.json" "$APP_SERVER_DIR/openai-pricing-snapshot.json"
+rm -f "$APP_SERVER_DIR/translation-schema.json"
 finish_step
 
 begin_step "native host launcher 생성"
