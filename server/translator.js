@@ -268,8 +268,14 @@ function normalizeQualityRetry(value) {
         .filter(Boolean)
         .slice(0, 20)
     : [];
+  const foreignChars = Array.isArray(value.foreignChars)
+    ? value.foreignChars
+        .map((char) => normalizeInlineString(char, 8))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
 
-  if (!itemId && !reason && missingNumbers.length === 0) {
+  if (!itemId && !reason && missingNumbers.length === 0 && foreignChars.length === 0) {
     return null;
   }
 
@@ -277,6 +283,7 @@ function normalizeQualityRetry(value) {
     itemId,
     reason,
     missingNumbers,
+    foreignChars,
   };
 }
 
@@ -313,6 +320,13 @@ function buildQualityRetryPromptLines(qualityRetry) {
 
   if (qualityRetry.missingNumbers.length > 0) {
     lines.push(`The previous output was missing these numeric tokens: ${qualityRetry.missingNumbers.join(", ")}.`);
+  }
+
+  if (qualityRetry.foreignChars.length > 0) {
+    lines.push(
+      `The previous output mixed in wrong-language characters (${qualityRetry.foreignChars.join(" ")}). ` +
+        "Write the translation in Korean only, keeping foreign words solely when the source itself contains them.",
+    );
   }
 
   return lines;

@@ -63,6 +63,20 @@ const numberItem = { ...item, text: `${item.text} It costs $12.` };
 const missingNumber = droppedFormatPair;
 assert.equal(api.isFormatMarkerOnlyFailure(numberItem, missingNumber), false);
 
+// The reported case: wrong-script characters leaking into the Korean output
+// ("ذهن적 모델") must fail validation and must never degrade to "apply anyway".
+const foreignScript = validText.replace("동작하는", "ذهن적");
+assert.throws(() => api.validateTranslationQuality(item, foreignScript), /다른 언어 문자/);
+assert.equal(api.isFormatMarkerOnlyFailure(item, foreignScript), false);
+
+// Foreign characters quoted in the source stay allowed in the translation.
+const quotedItem = { ...item, text: `${item.text} The word ذهن means mind.` };
+const quotedTranslation = `${validText} ذهن은 정신을 뜻합니다.`;
+api.validateTranslationQuality(quotedItem, quotedTranslation);
+
+// Latin, digits, and Han characters are normal in Korean prose.
+api.validateTranslationQuality(item, `${validText} API 서버는 美 서비스입니다.`);
+
 console.log("quality validation checks passed");
 
 function loadContentScriptInternals() {

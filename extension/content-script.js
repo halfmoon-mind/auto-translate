@@ -1481,6 +1481,49 @@
     if (missingNumbers.length > 0) {
       throw createMissingNumbersQualityError(item, sourceText, targetText, missingNumbers);
     }
+
+    const foreignChars = getForeignScriptChars(sourceText, targetText);
+
+    if (foreignChars.length > 0) {
+      throw createForeignScriptQualityError(item, sourceText, targetText, foreignChars);
+    }
+  }
+
+  // Korean output may mix Hangul, Latin, Han (hanja), and Common/Inherited
+  // characters (digits, punctuation, symbols). Anything else — Arabic, kana,
+  // Cyrillic, … — is model corruption unless the source itself contains it.
+  // ponytail: Han stays allowed, so Chinese-sentence leakage isn't caught;
+  // tighten to a Han ratio check if that ever shows up in the wild.
+  function getForeignScriptChars(sourceText, targetText) {
+    const allowed = /[\p{Script=Hangul}\p{Script=Latin}\p{Script=Han}\p{Script=Common}\p{Script=Inherited}]/u;
+    const sourceChars = new Set(sourceText);
+    const foreign = new Set();
+
+    for (const char of targetText) {
+      if (!allowed.test(char) && !sourceChars.has(char)) {
+        foreign.add(char);
+      }
+    }
+
+    return [...foreign];
+  }
+
+  function createForeignScriptQualityError(item, sourceText, targetText, foreignChars) {
+    const error = new Error(
+      `${QUALITY_ERROR_PREFIX}: ${item.id} 원문에 없는 다른 언어 문자가 섞였습니다 (${foreignChars.length}자).`,
+    );
+
+    Object.defineProperty(error, "translationQuality", {
+      value: {
+        itemId: item.id,
+        kind: item.kind || "paragraph",
+        reason: "foreign_script",
+        sourceLength: sourceText.length,
+        translatedLength: targetText.length,
+        foreignChars: foreignChars.slice(0, 20),
+      },
+    });
+    return error;
   }
 
   // A translation whose only defect is mangled [[CTX-FMT-*]] markers is still
@@ -1552,6 +1595,7 @@
       sourceNumberCount: details.sourceNumberCount,
       translatedNumberCount: details.translatedNumberCount,
       missingNumberCount: Array.isArray(details.missingNumbers) ? details.missingNumbers.length : 0,
+      foreignCharCount: Array.isArray(details.foreignChars) ? details.foreignChars.length : 0,
     };
   }
 
@@ -1562,6 +1606,7 @@
       itemId: details.itemId || "",
       reason: details.reason || "quality_validation_failed",
       missingNumbers: Array.isArray(details.missingNumbers) ? details.missingNumbers : [],
+      foreignChars: Array.isArray(details.foreignChars) ? details.foreignChars : [],
     };
   }
 
