@@ -35,7 +35,7 @@ Install the native bridge once:
 3. Confirm the completion dialog.
 4. Use the opened setup page to run `다시 확인`.
 
-Chrome launches the native host only while it is handling a health check or translation session. During a page translation, the extension keeps one native messaging port open so translation batches can reuse the same host process. The native host starts `codex app-server` for that translation session and shuts it down when the session ends; there is no long-running background server process to keep alive.
+Chrome launches the native host only while it is handling a health check or translation session. During a page translation, the extension keeps one native messaging port open so translation batches can reuse the same host process. The native host starts `codex app-server` for that translation session, and the extension keeps the session alive for a few idle minutes so consecutive page translations skip the cold start; the session closes automatically after the idle timeout.
 
 If the bridge is missing or cannot start, the extension popup shows `설정 열기`. That opens an in-extension setup page, so users do not need to hunt through this README to understand the next step.
 
@@ -125,10 +125,6 @@ CODEX_TRANSLATOR_MAX_CONTEXT_CHARS=6000
 CODEX_TRANSLATOR_MAX_PARAGRAPHS_PER_RUN=20
 CODEX_TRANSLATOR_MAX_TARGET_CHARS_PER_RUN=7000
 CODEX_TRANSLATOR_MAX_PARALLEL_RUNS=4
-CODEX_TRANSLATOR_ONE_SHOT_MAX_PARAGRAPHS=120
-CODEX_TRANSLATOR_ONE_SHOT_MAX_TARGET_CHARS=12000
-CODEX_TRANSLATOR_ONE_SHOT_MAX_TOTAL_TOKENS=16000
-CODEX_TRANSLATOR_ONE_SHOT_MAX_SINGLE_TARGET_CHARS=5000
 ```
 
 Set `CODEX_TRANSLATOR_MODEL=` to let Codex use its default model. Set `CODEX_TRANSLATOR_MODEL=gpt-5.3-codex-spark` if you have Spark quota and want the faster profile. `CODEX_TRANSLATOR_EFFORT=fast` is accepted as an alias for Codex's `low` reasoning effort.
@@ -139,6 +135,7 @@ The native bridge removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child pr
 
 ## Maintenance Notes
 
-- The extension sends one translation request per page translation. The local native host tries a guarded one-shot translation first, then falls back to medium-sized split runs when the page is too large or the one-shot output fails validation.
-- Large pages can still consume Codex usage quickly because the page text is sent as translation input.
+- The extension sends one translation request per page translation. The local native host splits the page into char-balanced batches and runs up to 4 in parallel; translated paragraphs stream back and appear in the page as each one completes.
+- If individual paragraphs fail client-side validation (missing numbers, markers, or URLs), only those paragraphs are retried once with a hint; the rest of the page keeps its translations.
+- Large pages can still consume Codex usage quickly because the page text is sent as translation input. Token usage shown in the popup is the real count reported by `codex app-server`.
 - The extension replaces paragraph text in the page. Use `원문 복원` before re-translating.
