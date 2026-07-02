@@ -690,7 +690,7 @@ class CodexAppServerClient {
       clientInfo: {
         name: "codex_context_translator",
         title: "Codex Context Translator",
-        version: "0.3.1",
+        version: "0.3.2",
       },
       capabilities: {
         experimentalApi: true,
