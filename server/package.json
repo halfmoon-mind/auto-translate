@@ -1,6 +1,6 @@
 {
   "name": "codex-context-translator-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Native bridge runtime for a Codex-powered Chrome translator.",
   "scripts": {
